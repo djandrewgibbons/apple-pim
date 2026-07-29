@@ -183,10 +183,38 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
       ctx.log?.warn?.("apple-mail: plugin runtime unavailable; not starting the poll loop");
       return;
     }
-    const store = state.openKeyedStore<PollCursor>({
-      namespace: `${CHANNEL_ID}:cursor`,
-      maxEntries: 64,
-    }) as CursorStore;
+    // Every durable surface this channel has goes through `openKeyedStore`, and the host
+    // refuses it unless the plugin is bundled or a trusted official install. A path-loaded
+    // or third-party install is neither, and the throw lands inside `startAccount`, which
+    // the gateway treats as a crashed channel and restarts ten times over several minutes.
+    // Fail once, say what to do, and stay down: retrying cannot change a trust decision.
+    let store: CursorStore;
+    try {
+      store = state.openKeyedStore<PollCursor>({
+        namespace: `${CHANNEL_ID}:cursor`,
+        maxEntries: 64,
+      }) as CursorStore;
+    } catch (error) {
+      ctx.log?.error?.(
+        `apple-mail: durable storage unavailable (${String(error)}). The channel needs it for ` +
+          `its poll cursor, thread records, quarantine, and run budget, and cannot run ` +
+          `safely without them: a lost cursor reprocesses the mailbox and a lost quarantine ` +
+          `un-blocks refused senders. Install the plugin through ClawHub rather than a local ` +
+          `path so the host grants it storage access.`,
+      );
+      // Deliberately not `return`. The gateway reads a returned `startAccount` as an exited
+      // channel and restarts it, so returning would repeat this diagnostic every few seconds
+      // for ten attempts. Retrying cannot change a trust decision, so the channel stays up
+      // and idle instead: one message, then nothing until shutdown.
+      await new Promise<void>((resolve) => {
+        if (ctx.abortSignal.aborted) {
+          resolve();
+          return;
+        }
+        ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return;
+    }
 
     const deps = createMailCliDeps({
       account: config.account,
