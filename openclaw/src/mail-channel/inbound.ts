@@ -21,6 +21,11 @@ export type MailboxMessage = {
   dateReceived?: string;
   isRead?: boolean;
   isJunk?: boolean;
+  /**
+   * Reported by `mail-cli messages`, so the agent learns attachments exist without anything
+   * being fetched. Deciding to open one is the model's call, like the body.
+   */
+  attachmentCount?: number;
 };
 
 /** Thread headers, fetched only when a message might be a reply. */
@@ -135,6 +140,15 @@ export type ClassifiedMessage = {
   message: MailboxMessage;
   address: string;
   decision: IngressDecision;
+  /**
+   * Which conversation this message belongs to, for session scoping.
+   *
+   * The anchor the agent already recorded for the thread when the claim resolves to one,
+   * so every later message in that exchange shares a session. Otherwise the message's own
+   * id, which makes it the root of a thread of its own. A newsletter therefore gets a
+   * session nobody else joins, and a reply joins the session its parent started.
+   */
+  threadKey: string;
 };
 
 export type ClassifyOptions = Pick<IngressInput, "minIdentifierAuthentication"> & {
@@ -172,18 +186,25 @@ export async function classifyMessage(
   const strengths = mailAuthToIdentifierStrengths(auth);
 
   let threadPermitted = false;
+  let threadKey = message.messageId;
   const records = options.threadRecords ? [...options.threadRecords] : [];
   if (records.length > 0 && deps.readThreadHeaders) {
     const headers = await deps.readThreadHeaders(message.messageId);
-    threadPermitted = decideThreadReply(
+    const thread = decideThreadReply(
       { inReplyTo: headers.inReplyTo, references: headers.references, senderAddress: address },
       records,
-    ).permitted;
+    );
+    threadPermitted = thread.permitted;
+    // Session scoping follows a resolved thread even when the reply is not permitted: a
+    // denied message still belongs to that conversation, and filing it elsewhere would
+    // split the agent's view of it.
+    threadKey = thread.matchedMessageId ?? threadKey;
   }
 
   return {
     message,
     address,
+    threadKey,
     decision: decideIngress({
       strengths,
       senderAddress: address,

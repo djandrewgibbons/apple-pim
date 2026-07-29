@@ -22,13 +22,17 @@ import type { ClassifiedMessage, PollCursor } from "./inbound.ts";
 import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
 import { runPollLoop, type CursorStore } from "./poll.ts";
 import {
-  createMailCliBodyReader,
   createMailCliDeps,
   createMailCliSender,
   readTrustedSenders,
 } from "./runtime.ts";
 import { checkChannelConfig } from "./config-check.ts";
 import { ThreadRecords, type ThreadRecordStore } from "./thread-store.ts";
+import {
+  loadQuarantine,
+  quarantineMessage,
+  quarantineSnapshot,
+} from "../../lib/mail-quarantine.js";
 import { dispatchAdmittedMessage } from "./dispatch.ts";
 import { dispatchReplyWithBufferedBlockDispatcher } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 
@@ -193,6 +197,21 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
     );
     await threads.hydrate();
 
+    // Messages the channel refuses are quarantined for the mail tool too. Without this the
+    // envelope-only prompt would be a bypass: a dropped message still has an id, and
+    // `apple_pim_mail` would happily read the body the channel just declined to deliver.
+    // Durable, because the cursor moves past a dropped message and it is never reclassified,
+    // so an in-memory set would forget it at the next restart.
+    const quarantineStore = state.openKeyedStore({
+      namespace: `${CHANNEL_ID}:quarantine`,
+      maxEntries: 64,
+    }) as {
+      lookup(key: string): Promise<[string, string][] | undefined>;
+      register(key: string, value: [string, string][]): Promise<void>;
+    };
+    const quarantineKey = `${CHANNEL_ID}:${ctx.accountId}`;
+    loadQuarantine(await quarantineStore.lookup(quarantineKey));
+
     const minIdentifierAuthentication = config.minIdentifierAuthentication ?? "asserted";
     const allowFrom = (config.allowFrom ?? []).map((entry) => String(entry));
 
@@ -214,6 +233,12 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
     const loop = runPollLoop(
       {
         ...deps,
+        onDropped: async (messages) => {
+          for (const entry of messages) {
+            quarantineMessage(entry.message.messageId, entry.decision.reason);
+          }
+          await quarantineStore.register(quarantineKey, quarantineSnapshot());
+        },
         onAdmitted: async (messages) => {
           // Tests and embedders can take over delivery entirely.
           if (admittedHandler) {
@@ -226,7 +251,6 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
               {
                 dispatchReply: dispatchReplyWithBufferedBlockDispatcher,
                 sendReply: createMailCliSender({ account: config.account }),
-                readBody: createMailCliBodyReader({ account: config.account }),
                 onSuppressed: ({ address, reason }) =>
                   ctx.log?.info?.(`apple-mail: reply to ${address} suppressed (${reason})`),
                 // The reply has already been sent by this point, so a store failure must not

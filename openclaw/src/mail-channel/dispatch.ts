@@ -11,7 +11,7 @@
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import type { ClassifiedMessage } from "./inbound.ts";
+import type { ClassifiedMessage, MailboxMessage } from "./inbound.ts";
 import { decideEgress, type EgressDecision } from "./policy.ts";
 
 /** Sends one reply. Injected so dispatch is testable without a mailbox. */
@@ -43,11 +43,13 @@ export type DispatchDeps = {
   dispatchReply: ReplyDispatcher;
   sendReply: ReplySender;
   /**
-   * Fetches the message body. Read here rather than during classification so a dropped
-   * message never costs a body fetch, and so the body is only ever loaded for mail the
-   * agent is actually going to see.
+   * Optional cheap-model summary of the body, sitting between the envelope and a full read.
+   *
+   * Off by default. When configured it reads the body on the agent's behalf, so it inherits
+   * the same rule the agent does: it runs only for a message that already passed admission.
+   * A summarizer that ran before the gate would read mail the channel decided to drop.
    */
-  readBody?: (messageId: string) => Promise<string | undefined>;
+  summarize?: (message: MailboxMessage) => Promise<string | undefined>;
   onSuppressed?: (params: { address: string; reason: string }) => void;
   /**
    * Records that the agent replied in this thread, which is what lets a later reply from
@@ -76,18 +78,36 @@ export type DispatchOptions = {
 };
 
 /**
- * Builds the prompt body.
+ * Builds the prompt: the envelope, never the body.
  *
- * The subject and body are attacker-authored for any sender the operator has not vetted,
- * so they are presented as quoted message content rather than as bare instructions.
+ * The channel does not decide what is worth reading. Sender and subject are usually enough
+ * to tell a newsletter from an instruction, and on a real mailbox the overwhelming majority
+ * of admitted mail is `observe`: readable, never repliable. Fetching every body meant a
+ * model call per newsletter whose output was then discarded, which cost money and retained
+ * nothing. So the agent gets the envelope and calls `apple_pim_mail` when it decides a
+ * message is worth opening.
+ *
+ * Everything here is attacker-authored for any sender the operator has not vetted, so it is
+ * presented as a labelled envelope rather than as bare instructions.
  */
-function buildPrompt(subject: string | undefined, body: string | undefined): string {
-  const parts: string[] = [];
-  if (subject) {
-    parts.push(`Subject: ${subject}`);
+function buildPrompt(message: MailboxMessage, summary: string | undefined): string {
+  const lines = [
+    `From: ${message.sender}`,
+    `Subject: ${message.subject ?? "(none)"}`,
+  ];
+  if (message.dateReceived) {
+    lines.push(`Date: ${message.dateReceived}`);
   }
-  if (body?.trim()) {
-    parts.push(body.trim());
+  if (message.attachmentCount) {
+    lines.push(`Attachments: ${message.attachmentCount}`);
+  }
+  // The id is what makes the envelope actionable: it is the handle the agent passes back to
+  // read the body or save an attachment.
+  lines.push(`Message-ID: ${message.messageId}`);
+
+  const parts = [lines.join("\n")];
+  if (summary?.trim()) {
+    parts.push(`Summary:\n${summary.trim()}`);
   }
   return parts.join("\n\n");
 }
@@ -122,7 +142,9 @@ export async function dispatchAdmittedMessage(
   options: DispatchOptions,
 ): Promise<{ replied: boolean; reason: string }> {
   const observeOnly = message.decision.admission === "observe";
-  const body = await deps.readBody?.(message.message.messageId);
+  // Runs after admission, never before: a summarizer ahead of the gate would read the body
+  // of mail the channel decided to drop.
+  const summary = await deps.summarize?.(message.message);
   let sentCount = 0;
   const egress = decideReplyDelivery(message, options);
   const mayReply = !observeOnly && egress.permitted.length > 0;
@@ -134,14 +156,16 @@ export async function dispatchAdmittedMessage(
 
   await deps.dispatchReply({
     ctx: {
-      // Subject and body together. Without the body the agent sees a subject line and
-      // nothing else, which reads as a real message and is not one.
-      Body: buildPrompt(message.message.subject, body),
+      // The envelope. The agent fetches the body itself if it decides to.
+      Body: buildPrompt(message.message, summary),
       From: message.address,
       To: options.operatorAddresses[0],
-      // One session per sender per account: mail threads outlive any single exchange,
-      // and collapsing senders into one session would let one correspondent read another.
-      SessionKey: `${options.sessionPrefix}:${message.address}`,
+      // One session per thread, not per sender. A sender-keyed session never ends, so it
+      // grows without bound and mixes unrelated conversations; a thread has a natural start
+      // and finish. `threadKey` is the anchor the agent recorded for this thread, so every
+      // message in it lands in the same session, and correspondents still cannot read each
+      // other because no thread spans two of them.
+      SessionKey: `${options.sessionPrefix}:${message.threadKey}`,
     },
     cfg: options.cfg,
     dispatcherOptions: {

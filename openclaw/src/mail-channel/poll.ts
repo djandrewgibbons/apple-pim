@@ -116,6 +116,14 @@ export async function runPollCycle(
 export type PollLoopDeps = {
   /** Called with the messages a cycle admitted. Dropped messages never reach it. */
   onAdmitted: (messages: ClassifiedMessage[]) => Promise<void> | void;
+  /**
+   * Called with the messages a cycle refused, before the cursor moves past them.
+   *
+   * A dropped message is never reclassified, so this is the only moment the decision
+   * exists. The channel uses it to quarantine the id against the mail tool, which is what
+   * stops an envelope-only prompt from becoming a way to fetch bodies the policy rejected.
+   */
+  onDropped?: (messages: ClassifiedMessage[]) => Promise<void> | void;
   /** Reports a cycle that threw. The loop continues regardless. */
   onError?: (error: unknown) => void;
   /** Reports that the page ceiling was hit with unread mail still behind it. */
@@ -157,6 +165,12 @@ export async function runPollLoop(
       const { classified, cursor, truncated } = await runPollCycle(deps, options, store);
       if (truncated) {
         deps.onTruncated?.({ mailbox: options.mailbox, limit: options.maxLimit ?? DEFAULT_MAX_LIMIT });
+      }
+      const dropped = classified.filter((entry) => entry.decision.admission === "drop");
+      if (dropped.length > 0) {
+        // Ahead of delivery and ahead of the cursor: a refusal that is not recorded before
+        // the cursor advances is a refusal nothing can act on afterwards.
+        await deps.onDropped?.(dropped);
       }
       const admitted = classified.filter((entry) => entry.decision.admission !== "drop");
       if (admitted.length > 0) {

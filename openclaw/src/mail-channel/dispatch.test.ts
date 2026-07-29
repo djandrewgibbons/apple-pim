@@ -20,6 +20,7 @@ function classified(
     message: { messageId: "m1", sender: address, subject: "hello" },
     address,
     decision: { admission, reason: "allowlisted_and_authenticated" },
+    threadKey: "m1",
   } as ClassifiedMessage;
 }
 
@@ -101,31 +102,50 @@ describe("dispatchAdmittedMessage", () => {
     assert.deepEqual(sent, []);
   });
 
-  // Greptile P1: the agent used to receive only the subject line.
-  it("gives the agent the body, not just the subject", async () => {
+  // The body is never fetched for the agent. Sender and subject decide whether it is worth
+  // opening, and the agent opens it itself via the message id.
+  it("gives the agent the envelope and the id, never the body", async () => {
     const bodies: (string | undefined)[] = [];
     const { deps: d } = deps({
-      readBody: async () => "the actual message body",
       dispatchReply: async ({ ctx }) => {
         bodies.push(ctx.Body);
       },
     });
-    await dispatchAdmittedMessage(classified("omar@shahine.com"), d, OPTIONS);
-    assert.equal(bodies[0], "Subject: hello\n\nthe actual message body");
+    const m = classified("omar@shahine.com");
+    m.message.dateReceived = "2026-07-29T14:02:00Z";
+    m.message.attachmentCount = 2;
+    await dispatchAdmittedMessage(m, d, OPTIONS);
+    assert.equal(
+      bodies[0],
+      "From: omar@shahine.com\nSubject: hello\nDate: 2026-07-29T14:02:00Z\nAttachments: 2\nMessage-ID: m1",
+    );
   });
 
-  it("still dispatches something useful when there is no subject", async () => {
+  it("omits date and attachments when there are none, and names a missing subject", () => {
     const bodies: (string | undefined)[] = [];
     const { deps: d } = deps({
-      readBody: async () => "body only",
       dispatchReply: async ({ ctx }) => {
         bodies.push(ctx.Body);
       },
     });
     const m = classified("omar@shahine.com");
     m.message.subject = undefined;
-    await dispatchAdmittedMessage(m, d, OPTIONS);
-    assert.equal(bodies[0], "body only");
+    return dispatchAdmittedMessage(m, d, OPTIONS).then(() => {
+      assert.equal(bodies[0], "From: omar@shahine.com\nSubject: (none)\nMessage-ID: m1");
+    });
+  });
+
+  // Opt-in, and it runs after admission so it never reads mail the channel dropped.
+  it("includes a cheap-model summary when one is configured", async () => {
+    const bodies: (string | undefined)[] = [];
+    const { deps: d } = deps({
+      summarize: async () => "A receipt for one coffee.",
+      dispatchReply: async ({ ctx }) => {
+        bodies.push(ctx.Body);
+      },
+    });
+    await dispatchAdmittedMessage(classified("omar@shahine.com"), d, OPTIONS);
+    assert.match(bodies[0] ?? "", /Summary:\nA receipt for one coffee\.$/);
   });
 
   // Greptile P2: permission is not delivery.
@@ -141,19 +161,46 @@ describe("dispatchAdmittedMessage", () => {
     assert.equal(r.reason, "empty_reply");
   });
 
-  it("scopes the session per sender so correspondents cannot read each other", async () => {
+  // Per thread, not per sender. A sender-keyed session never ends and mixes unrelated
+  // conversations; a thread has a natural start and finish.
+  it("scopes the session per thread", async () => {
     const keys: (string | undefined)[] = [];
     const { deps: d } = deps({
       dispatchReply: async ({ ctx }) => {
         keys.push(ctx.SessionKey);
       },
     });
-    await dispatchAdmittedMessage(classified("omar@shahine.com"), d, OPTIONS);
-    await dispatchAdmittedMessage(classified("known@example.com"), d, OPTIONS);
+    const first = classified("omar@shahine.com");
+    const laterInSameThread = classified("omar@shahine.com");
+    laterInSameThread.message.messageId = "m2";
+    laterInSameThread.threadKey = "m1";
+    const unrelated = classified("omar@shahine.com");
+    unrelated.message.messageId = "m3";
+    unrelated.threadKey = "m3";
+
+    for (const m of [first, laterInSameThread, unrelated]) {
+      await dispatchAdmittedMessage(m, d, OPTIONS);
+    }
     assert.deepEqual(keys, [
-      "apple-mail:default:omar@shahine.com",
-      "apple-mail:default:known@example.com",
+      "apple-mail:default:m1",
+      "apple-mail:default:m1",
+      "apple-mail:default:m3",
     ]);
+  });
+
+  it("keeps two senders in one thread together, since no thread spans strangers", async () => {
+    const keys: (string | undefined)[] = [];
+    const { deps: d } = deps({
+      dispatchReply: async ({ ctx }) => {
+        keys.push(ctx.SessionKey);
+      },
+    });
+    const a = classified("omar@shahine.com");
+    const b = classified("known@example.com");
+    b.threadKey = "m1";
+    await dispatchAdmittedMessage(a, d, OPTIONS);
+    await dispatchAdmittedMessage(b, d, OPTIONS);
+    assert.deepEqual(keys, ["apple-mail:default:m1", "apple-mail:default:m1"]);
   });
 });
 
