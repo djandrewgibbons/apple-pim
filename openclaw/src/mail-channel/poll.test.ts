@@ -78,24 +78,58 @@ describe("runPollCycle", () => {
 
   // Greptile P1: newest-first paging stops short of the cursor when a burst arrives, and
   // advancing the watermark from that subset would skip the rest permanently.
-  it("widens the page to reach back past the cursor", async () => {
+  // Greptile P1: listing newest-first meant a flood of new mail could push an older
+  // unprocessed message past the row limit permanently. The page now starts at the cursor
+  // and walks forward, so the backlog's oldest end is always what gets read.
+  it("pages forward from the cursor rather than grabbing the newest page", async () => {
     const store = memoryStore();
     await store.register(OPTIONS.cursorKey, { lastDateReceived: "2026-07-28T09:00:00.000Z" });
-    const burst = Array.from({ length: 7 }, (_, i) =>
-      msg(`b${i}`, `2026-07-28T10:0${i}:00.000Z`),
-    );
-    let lastLimit = 0;
+    let sinceSeen: string | undefined;
     const d: InboundDeps = {
-      listMessages: async ({ limit }) => {
-        lastLimit = limit;
-        return burst.slice(-limit);
+      listMessages: async ({ since, limit }) => {
+        sinceSeen = since;
+        return [msg("old", "2026-07-28T09:30:00.000Z")].slice(0, limit);
       },
       authCheck: async () => VERIFIED,
     };
-    const r = await runPollCycle(d, { ...OPTIONS, limit: 2, maxLimit: 64 }, store);
-    assert.ok(lastLimit > 2, "should have widened past the initial limit");
-    assert.equal(r.classified.length, 7);
-    assert.equal(r.truncated, false);
+    await runPollCycle(d, { ...OPTIONS, limit: 2 }, store);
+    assert.equal(sinceSeen, "2026-07-28T09:00:00.000Z", "the cursor bounds the listing");
+  });
+
+  it("takes the newest page on a cold start, not the whole mailbox history", async () => {
+    let sinceSeen: string | undefined = "unset";
+    const d: InboundDeps = {
+      listMessages: async ({ since }) => {
+        sinceSeen = since;
+        return [];
+      },
+      authCheck: async () => VERIFIED,
+    };
+    const r = await runPollCycle(d, OPTIONS, memoryStore());
+    assert.equal(sinceSeen, undefined, "no cursor means no --since, so the CLI's newest page");
+    assert.equal(r.truncated, false, "and a cold start is never truncated");
+  });
+
+  // A flood cannot bury older mail now: the flood is *newer*, so it sorts behind the
+  // backlog and simply waits its turn.
+  it("reads the oldest unprocessed mail even when newer mail floods in", async () => {
+    const store = memoryStore();
+    await store.register(OPTIONS.cursorKey, { lastDateReceived: "2026-07-28T09:00:00.000Z" });
+    const pending = msg("legitimate", "2026-07-28T09:30:00.000Z");
+    const flood = Array.from({ length: 500 }, (_, i) => msg(`spam${i}`, "2026-07-28T23:00:00.000Z"));
+    const d: InboundDeps = {
+      // The engine returns oldest-first when `since` is set, which is the contract the
+      // CLI now implements.
+      listMessages: async ({ limit }) => [pending, ...flood].slice(0, limit),
+      authCheck: async () => VERIFIED,
+    };
+    const r = await runPollCycle(d, { ...OPTIONS, limit: 2 }, store);
+    assert.equal(
+      r.classified[0]?.message.messageId,
+      "legitimate",
+      "the pending message is read first, not buried under the flood",
+    );
+    assert.equal(r.truncated, true, "and the rest is reported as still pending");
   });
 
   it("flags truncation instead of silently skipping when the ceiling is hit", async () => {
@@ -257,9 +291,12 @@ describe("runPollLoop", () => {
     assert.deepEqual(delivered, ["a"]);
   });
 
-  // Greptile P1: reporting truncation was not enough; the cursor still advanced past the
-  // mail still sitting behind the ceiling.
-  it("does not advance the cursor on a truncated cycle", async () => {
+  // Holding the cursor here was an earlier fix and it was wrong, as Codex pointed out.
+  // Listing is newest-first, so a held cursor re-lists and redelivers the same newest page
+  // every cycle and *still* never reaches the older mail, because the page can only grow
+  // back from now. Advancing turns unbounded duplicate delivery plus loss into loss, once,
+  // reported loudly.
+  it("advances the cursor on a truncated cycle, bounding loss instead of looping", async () => {
     const store = memoryStore();
     await store.register(OPTIONS.cursorKey, { lastDateReceived: "2026-07-28T09:00:00.000Z" });
     const before = store.values.get(OPTIONS.cursorKey);
@@ -281,12 +318,20 @@ describe("runPollLoop", () => {
       signal,
     );
     assert.equal(truncations, 1);
-    assert.deepEqual(store.values.get(OPTIONS.cursorKey), before);
+    assert.notDeepEqual(
+      store.values.get(OPTIONS.cursorKey),
+      before,
+      "cursor must move, or this page is redelivered forever and the backlog is still lost",
+    );
+    assert.equal(
+      store.values.get(OPTIONS.cursorKey)?.lastDateReceived,
+      "2026-07-28T11:00:00.000Z",
+    );
   });
 
   // A truncated cycle must still sleep. An earlier version used `continue`, which skipped
   // the sleep and spun a tight infinite loop; the only symptom was a hanging test run.
-  it("holds the cursor on truncation without spinning the loop", async () => {
+  it("reports truncation and still advances, without spinning the loop", async () => {
     const store = memoryStore();
     // Seed a prior cursor: truncation is only possible once there is a watermark to fall
     // short of. A cold start deliberately takes the page as-is.
@@ -319,10 +364,10 @@ describe("runPollLoop", () => {
       controller.signal,
     );
     assert.equal(sleeps, 2, "each truncated cycle must reach the sleep");
-    assert.deepEqual(
+    assert.notDeepEqual(
       store.values.get(OPTIONS.cursorKey),
       seeded,
-      "cursor must not advance past a truncated page",
+      "the cursor advances; truncation is reported, not held",
     );
   });
 
@@ -371,5 +416,266 @@ describe("runPollLoop", () => {
       signal,
     );
     assert.equal(maxInFlight, 1);
+  });
+});
+
+// The breaker has to defer, not discard. Holding the cursor costs a re-classification next
+// cycle; advancing it would lose an operator's mail to a burst of newsletters.
+describe("circuit breaker", () => {
+  const message = {
+    messageId: "m1",
+    sender: "omar@shahine.com",
+    dateReceived: "2026-07-29T10:00:00Z",
+  };
+
+  function loopDeps(allowed: boolean) {
+    const registered: unknown[] = [];
+    const admitted: string[] = [];
+    const throttled: { pending: number }[] = [];
+    const controller = new AbortController();
+    return {
+      registered,
+      admitted,
+      throttled,
+      controller,
+      run: () =>
+        runPollLoop(
+          {
+            listMessages: async () => [message],
+            authCheck: async () => ({
+              verdict: "verified" as const,
+              sender: "omar@shahine.com",
+              checks: {
+                dkim: { result: "pass", signingDomain: "shahine.com", match: true },
+                spf: { result: "pass", mailFrom: "omar@shahine.com", aligned: true, match: true },
+              },
+            }),
+            onAdmitted: async (m) => {
+              admitted.push(...m.map((e) => e.message.messageId));
+            },
+            checkBudget: () => ({ allowed, window: "hour", retryAtMs: 1 }),
+            onThrottled: (p) => throttled.push(p),
+            sleep: async () => controller.abort(),
+          },
+          {
+            mailbox: "INBOX",
+            limit: 10,
+            cursorKey: "k",
+            intervalMs: 1,
+            classify: { minIdentifierAuthentication: "asserted" },
+          },
+          {
+            lookup: async () => undefined,
+            register: async (_k, v) => {
+              registered.push(v);
+            },
+          },
+          controller.signal,
+        ),
+    };
+  }
+
+  it("delivers and advances the cursor when the breaker is closed", async () => {
+    const t = loopDeps(true);
+    await t.run();
+    assert.deepEqual(t.admitted, ["m1"]);
+    assert.equal(t.registered.length, 1, "cursor persisted");
+    assert.deepEqual(t.throttled, []);
+  });
+
+  it("holds the cursor and delivers nothing when the breaker is open", async () => {
+    const t = loopDeps(false);
+    await t.run();
+    assert.deepEqual(t.admitted, [], "no agent run");
+    assert.deepEqual(t.registered, [], "cursor held, so the batch is retried not lost");
+    assert.deepEqual(t.throttled, [{ window: "hour", retryAtMs: 1, pending: 1 }]);
+  });
+
+  it("does not report throttling when there is nothing to deliver", async () => {
+    const controller = new AbortController();
+    const throttled: unknown[] = [];
+    await runPollLoop(
+      {
+        listMessages: async () => [],
+        authCheck: async () => ({ verdict: "verified" as const }),
+        onAdmitted: async () => {},
+        checkBudget: () => ({ allowed: false, window: "hour" }),
+        onThrottled: (p) => throttled.push(p),
+        sleep: async () => controller.abort(),
+      },
+      {
+        mailbox: "INBOX",
+        limit: 10,
+        cursorKey: "k",
+        intervalMs: 1,
+        classify: { minIdentifierAuthentication: "asserted" },
+      },
+      { lookup: async () => undefined, register: async () => {} },
+      controller.signal,
+    );
+    assert.deepEqual(throttled, []);
+  });
+});
+
+// Codex, second pass: holding the whole cursor on a partial batch replayed everything
+// already delivered, and could starve the undelivered tail forever if the batch kept
+// exceeding the budget. Oldest-first dispatch makes a partial cursor expressible.
+describe("partial delivery", () => {
+  function boundedSignal(cycles: number) {
+    const controller = new AbortController();
+    let seen = 0;
+    return {
+      signal: controller.signal,
+      sleep: async () => {
+        seen += 1;
+        if (seen >= cycles) {
+          controller.abort();
+        }
+      },
+    };
+  }
+
+  it("hands messages to the delivery callback oldest first", async () => {
+    const { signal, sleep } = boundedSignal(1);
+    const seen: string[] = [];
+    await runPollLoop(
+      {
+        listMessages: async () => [
+          msg("newest", "2026-07-28T12:00:00.000Z"),
+          msg("oldest", "2026-07-28T10:00:00.000Z"),
+          msg("middle", "2026-07-28T11:00:00.000Z"),
+        ],
+        authCheck: async () => VERIFIED,
+        onAdmitted: (messages) => {
+          seen.push(...messages.map((m) => m.message.messageId));
+        },
+        sleep,
+      },
+      { ...OPTIONS, intervalMs: 1 },
+      memoryStore(),
+      signal,
+    );
+    assert.deepEqual(seen, ["oldest", "middle", "newest"]);
+  });
+
+  it("advances the cursor through the delivered prefix only", async () => {
+    const store = memoryStore();
+    const { signal, sleep } = boundedSignal(1);
+    await runPollLoop(
+      {
+        listMessages: async () => [
+          msg("a", "2026-07-28T10:00:00.000Z"),
+          msg("b", "2026-07-28T11:00:00.000Z"),
+          msg("c", "2026-07-28T12:00:00.000Z"),
+        ],
+        authCheck: async () => VERIFIED,
+        // Budget runs out after two.
+        onAdmitted: () => ({ completed: 2 }),
+        sleep,
+      },
+      { ...OPTIONS, intervalMs: 1 },
+      store,
+      signal,
+    );
+    const cursor = store.values.get(OPTIONS.cursorKey);
+    assert.equal(
+      cursor?.lastDateReceived,
+      "2026-07-28T11:00:00.000Z",
+      "cursor sits at the last delivered message, not the last listed one",
+    );
+  });
+
+  it("redelivers neither the prefix nor loses the suffix across cycles", async () => {
+    const store = memoryStore();
+    const { signal, sleep } = boundedSignal(2);
+    const delivered: string[] = [];
+    let cycle = 0;
+    await runPollLoop(
+      {
+        listMessages: async () => [
+          msg("a", "2026-07-28T10:00:00.000Z"),
+          msg("b", "2026-07-28T11:00:00.000Z"),
+          msg("c", "2026-07-28T12:00:00.000Z"),
+        ],
+        authCheck: async () => VERIFIED,
+        onAdmitted: (messages) => {
+          cycle += 1;
+          const budget = cycle === 1 ? 2 : messages.length;
+          delivered.push(...messages.slice(0, budget).map((m) => m.message.messageId));
+          return { completed: budget };
+        },
+        sleep,
+      },
+      { ...OPTIONS, intervalMs: 1 },
+      store,
+      signal,
+    );
+    assert.deepEqual(delivered, ["a", "b", "c"], "each message delivered exactly once");
+  });
+});
+
+// Codex, third pass: cursorThrough built a cursor from the delivered slice alone. A prefix
+// of only undated messages then produced no watermark at all, resetting the cursor to cold
+// and redelivering every dated message in the mailbox.
+describe("partial cursor merges with the previous one", () => {
+  function boundedSignal(cycles: number) {
+    const controller = new AbortController();
+    let seen = 0;
+    return {
+      signal: controller.signal,
+      sleep: async () => {
+        seen += 1;
+        if (seen >= cycles) {
+          controller.abort();
+        }
+      },
+    };
+  }
+
+  async function runOnce(store: ReturnType<typeof memoryStore>, messages: MailboxMessage[], completed: number) {
+    const { signal, sleep } = boundedSignal(1);
+    await runPollLoop(
+      {
+        listMessages: async () => messages,
+        authCheck: async () => VERIFIED,
+        onAdmitted: () => ({ completed }),
+        sleep,
+      },
+      { ...OPTIONS, intervalMs: 1 },
+      store,
+      signal,
+    );
+    return store.values.get(OPTIONS.cursorKey);
+  }
+
+  it("keeps the existing watermark when the delivered prefix is undated", async () => {
+    const store = memoryStore();
+    await store.register(OPTIONS.cursorKey, { lastDateReceived: "2026-07-28T09:00:00.000Z" });
+    const undated = { messageId: "u1", sender: "a@example.com" } as MailboxMessage;
+    const cursor = await runOnce(store, [undated, msg("dated", "2026-07-28T12:00:00.000Z")], 1);
+    assert.equal(
+      cursor?.lastDateReceived,
+      "2026-07-28T09:00:00.000Z",
+      "watermark must not be erased by an undated-only prefix",
+    );
+    assert.deepEqual(cursor?.seenUndated, ["u1"]);
+  });
+
+  it("never moves the watermark backwards", async () => {
+    const store = memoryStore();
+    await store.register(OPTIONS.cursorKey, { lastDateReceived: "2026-07-28T15:00:00.000Z" });
+    const cursor = await runOnce(store, [msg("old", "2026-07-28T16:00:00.000Z")], 0);
+    assert.equal(cursor?.lastDateReceived, "2026-07-28T15:00:00.000Z");
+  });
+
+  it("carries prior undated ids forward", async () => {
+    const store = memoryStore();
+    await store.register(OPTIONS.cursorKey, {
+      lastDateReceived: "2026-07-28T09:00:00.000Z",
+      seenUndated: ["older-undated"],
+    });
+    const undated = { messageId: "u2", sender: "a@example.com" } as MailboxMessage;
+    const cursor = await runOnce(store, [undated, msg("d", "2026-07-28T12:00:00.000Z")], 1);
+    assert.deepEqual(cursor?.seenUndated, ["older-undated", "u2"]);
   });
 });

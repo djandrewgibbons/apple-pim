@@ -49,44 +49,84 @@ export type PollCycleResult = {
 const DEFAULT_MAX_LIMIT = 500;
 
 /**
- * Lists far enough back to reach the previous cursor.
+ * A cursor covering the previous one plus exactly the messages handed in, for a partially
+ * delivered batch.
  *
- * Listing is newest-first with a limit, so if more than `limit` messages arrive between
- * cycles the page stops short of the cursor and everything behind it would be skipped
- * forever once the watermark advanced. This widens the page until it reaches back past the
- * cursor, the page is no longer full, or the ceiling is hit.
+ * Merged with `previous` rather than built fresh. A prefix consisting only of undated
+ * messages has no watermark of its own, and returning one without `lastDateReceived` would
+ * reset the cursor to cold and redeliver every dated message in the mailbox. The same
+ * applies to `seenUndated`: dropping the inherited ids lets older undated mail replay.
  *
- * With no cursor yet the page is taken as-is: a first run starts from now rather than
- * ingesting the entire mailbox history.
+ * Undated messages are recorded by id, because they cannot be placed against a watermark.
+ */
+function cursorThrough(
+  previous: PollCursor,
+  delivered: readonly ClassifiedMessage[],
+): PollCursor {
+  const dates = delivered.map((e) => e.message.dateReceived).filter(Boolean) as string[];
+  const deliveredHighest = dates.sort().at(-1);
+  // Never move the watermark backwards: a partial batch can only ever add to what the
+  // previous cursor already covered.
+  const highest =
+    deliveredHighest && (!previous.lastDateReceived || deliveredHighest > previous.lastDateReceived)
+      ? deliveredHighest
+      : previous.lastDateReceived;
+
+  const atWatermark = delivered
+    .filter((e) => e.message.dateReceived && e.message.dateReceived === highest)
+    .map((e) => e.message.messageId);
+
+  return {
+    lastDateReceived: highest,
+    // Carry the prior ids forward when the watermark did not move, so a partial batch that
+    // adds nothing newer cannot erase the dedupe set for that instant.
+    seenAtWatermark:
+      highest && highest === previous.lastDateReceived
+        ? [...new Set([...(previous.seenAtWatermark ?? []), ...atWatermark])]
+        : atWatermark,
+    seenUndated: [
+      ...new Set([
+        ...(previous.seenUndated ?? []),
+        ...delivered.filter((e) => !e.message.dateReceived).map((e) => e.message.messageId),
+      ]),
+    ].slice(-MAX_SEEN_UNDATED_CURSOR),
+  };
+}
+
+/** Mirrors the bound in `selectNewMessages`, which owns the same field. */
+const MAX_SEEN_UNDATED_CURSOR = 200;
+
+/**
+ * Lists the oldest unprocessed messages, paging forward from the cursor.
+ *
+ * This used to list newest-first and widen the page until it reached back past the cursor.
+ * That could not work: the page grows backwards from *now*, so once more than `maxLimit`
+ * messages sat between the cursor and the present, older mail was unreachable no matter what
+ * the loop did. Advancing skipped it, holding redelivered the newest page forever, and
+ * either way anyone who could flood the mailbox could push a real message out of reach.
+ *
+ * Passing the cursor as `--since` inverts it: the page starts at the backlog's oldest end
+ * and walks forward, so a flood delays delivery by a cycle or two and never prevents it.
+ * Truncation stops being a correctness problem and becomes ordinary paging.
+ *
+ * With no cursor yet the page is taken as-is, newest-first: a first run starts from now
+ * rather than ingesting the entire mailbox history.
  */
 async function listBackToCursor(
   deps: InboundDeps,
   options: PollOptions,
   previousWatermark: string | undefined,
 ): Promise<{ messages: MailboxMessage[]; truncated: boolean }> {
-  const ceiling = options.maxLimit ?? DEFAULT_MAX_LIMIT;
-  let limit = options.limit;
-  let messages = await deps.listMessages({ mailbox: options.mailbox, limit });
+  const limit = options.limit;
+  const messages = await deps.listMessages({
+    mailbox: options.mailbox,
+    limit,
+    since: previousWatermark,
+  });
 
-  if (!previousWatermark) {
-    return { messages, truncated: false };
-  }
-
-  while (messages.length >= limit && limit < ceiling) {
-    const dates = messages.map((m) => m.dateReceived).filter(Boolean) as string[];
-    const oldest = dates.sort()[0];
-    if (oldest && oldest <= previousWatermark) {
-      // The page now spans the cursor, so nothing is hiding behind it.
-      return { messages, truncated: false };
-    }
-    limit = Math.min(limit * 4, ceiling);
-    messages = await deps.listMessages({ mailbox: options.mailbox, limit });
-  }
-
-  const dates = messages.map((m) => m.dateReceived).filter(Boolean) as string[];
-  const oldest = dates.sort()[0];
-  const stillShort = messages.length >= limit && !!oldest && oldest > previousWatermark;
-  return { messages, truncated: stillShort };
+  // A full page means there is more behind it. That is now just "more to do next cycle",
+  // not mail at risk: the next page starts where this one ended.
+  return { messages, truncated: !!previousWatermark && messages.length >= limit };
 }
 
 /**
@@ -114,8 +154,20 @@ export async function runPollCycle(
 }
 
 export type PollLoopDeps = {
-  /** Called with the messages a cycle admitted. Dropped messages never reach it. */
-  onAdmitted: (messages: ClassifiedMessage[]) => Promise<void> | void;
+  /**
+   * Called with the messages a cycle admitted. Dropped messages never reach it.
+   *
+   * Receives messages **oldest first**, and may return `{ completed }` to say it stopped
+   * early. The cursor then advances through exactly the completed prefix, so the untouched
+   * suffix is retried next cycle and the delivered prefix is not.
+   *
+   * Oldest-first is what makes a partial cursor expressible. Dispatching newest-first would
+   * leave the undelivered messages *behind* the watermark, where advancing loses them and
+   * holding replays everything already delivered.
+   */
+  onAdmitted: (
+    messages: ClassifiedMessage[],
+  ) => Promise<void | { completed: number }> | void | { completed: number };
   /**
    * Called with the messages a cycle refused, before the cursor moves past them.
    *
@@ -128,6 +180,14 @@ export type PollLoopDeps = {
   onError?: (error: unknown) => void;
   /** Reports that the page ceiling was hit with unread mail still behind it. */
   onTruncated?: (params: { mailbox: string; limit: number }) => void;
+  /**
+   * Whether the agent may run at all this cycle. Returns a refusal when the circuit breaker
+   * is open, which holds the cursor rather than discarding the batch: a burst is deferred,
+   * never lost.
+   */
+  checkBudget?: () => { allowed: boolean; window?: string; retryAtMs?: number };
+  /** Reports a cycle skipped because the breaker was open. */
+  onThrottled?: (params: { window?: string; retryAtMs?: number; pending: number }) => void;
   /** Injected so tests do not wait in real time. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 };
@@ -162,6 +222,9 @@ export async function runPollLoop(
   const sleep = deps.sleep ?? defaultSleep;
   while (!signal.aborted) {
     try {
+      // Read once per cycle: the partial cursor has to be merged onto what was already
+      // persisted, not built from the delivered slice alone.
+      const previous = (await store.lookup(options.cursorKey)) ?? {};
       const { classified, cursor, truncated } = await runPollCycle(deps, options, store);
       if (truncated) {
         deps.onTruncated?.({ mailbox: options.mailbox, limit: options.maxLimit ?? DEFAULT_MAX_LIMIT });
@@ -173,21 +236,57 @@ export async function runPollLoop(
         await deps.onDropped?.(dropped);
       }
       const admitted = classified.filter((entry) => entry.decision.admission !== "drop");
+      // The breaker is consulted only when there is something to spend budget on, so a quiet
+      // mailbox never reports itself throttled.
+      const budget = admitted.length > 0 ? (deps.checkBudget?.() ?? { allowed: true }) : { allowed: true };
+      if (!budget.allowed) {
+        // Hold the cursor. Reclassifying this page next cycle costs an auth-check per
+        // message, which is the right price for not losing an operator's mail to a burst
+        // of newsletters.
+        deps.onThrottled?.({
+          window: budget.window,
+          retryAtMs: budget.retryAtMs,
+          pending: admitted.length,
+        });
+        if (!signal.aborted) {
+          await sleep(options.intervalMs, signal);
+        }
+        continue;
+      }
+      let partialCursor: PollCursor | undefined;
       if (admitted.length > 0) {
+        // Oldest first, so a partial delivery has a cursor that can describe it.
+        const ordered = [...admitted].sort((a, b) =>
+          (a.message.dateReceived ?? "").localeCompare(b.message.dateReceived ?? ""),
+        );
         // Deliver first. If this throws, the cursor is left untouched and the batch is
         // retried next cycle rather than silently skipped.
-        await deps.onAdmitted(admitted);
+        const outcome = await deps.onAdmitted(ordered);
+        const completed = outcome?.completed ?? ordered.length;
+        if (completed < ordered.length) {
+          deps.onThrottled?.({ pending: ordered.length - completed });
+          // Advance only through what was delivered. Holding everything would replay the
+          // delivered prefix on every retry and, if the batch keeps exceeding the budget,
+          // starve the suffix forever.
+          partialCursor = cursorThrough(previous, ordered.slice(0, completed));
+        }
       }
-      // Reporting truncation is not enough. The cursor derives from a newest-first
-      // partial page, so persisting it would bury the older mail still behind the
-      // ceiling. Holding it reprocesses this page next cycle, which is duplicates
-      // instead of loss, and truncation keeps being reported until the backlog drains
-      // or the operator raises maxLimit.
+      // Truncation advances the cursor even though mail behind the ceiling was never
+      // examined. Holding it instead looks safer and is worse: listing is newest-first, so
+      // a held cursor re-lists the same newest page every cycle, redelivers it every cycle,
+      // and still never reaches the older mail, because the page can only ever grow up to
+      // `maxLimit` back from *now*. That is unbounded duplicate delivery plus the same loss.
+      // Advancing bounds it to loss, once, reported loudly enough for the operator to raise
+      // `maxLimit` or narrow the mailbox.
+      //
+      // A deferred batch is different and is genuinely retryable, so its cursor is held.
       //
       // Deliberately not `continue`: that would skip the sleep below and spin the loop.
-      if (!truncated) {
-        await store.register(options.cursorKey, cursor);
-      }
+      // A partial cursor wins over the full one, and over truncation: it describes exactly
+      // what was delivered, which is the only claim safe to persist. When it is absent the
+      // full cursor applies, truncated or not, because a fully delivered page has nothing
+      // left to retry and holding it would re-list the same newest page forever.
+      await store.register(options.cursorKey, partialCursor ?? cursor);
     } catch (error) {
       deps.onError?.(error);
     }

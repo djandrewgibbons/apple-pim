@@ -27,6 +27,7 @@ import {
   readTrustedSenders,
 } from "./runtime.ts";
 import { checkChannelConfig } from "./config-check.ts";
+import { RunBudget, resolveRateLimits, type BreakerStore } from "./rate-limit.ts";
 import { ThreadRecords, type ThreadRecordStore } from "./thread-store.ts";
 import {
   loadQuarantine,
@@ -60,6 +61,12 @@ export type ResolvedAppleMailAccount = {
     pageSize?: number;
     /** Path to trusted-senders.json. */
     trustedSendersPath?: string;
+    /**
+     * Circuit breaker on agent runs. Default-deny bounds who may drive the agent, not how
+     * much: one permitted correspondent in a loop is otherwise unlimited model calls.
+     */
+    maxAgentRunsPerHour?: number;
+    maxAgentRunsPerDay?: number;
   };
 };
 
@@ -210,7 +217,18 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
       register(key: string, value: [string, string][]): Promise<void>;
     };
     const quarantineKey = `${CHANNEL_ID}:${ctx.accountId}`;
-    loadQuarantine(await quarantineStore.lookup(quarantineKey));
+    loadQuarantine(quarantineKey, await quarantineStore.lookup(quarantineKey));
+
+    const limits = resolveRateLimits(config);
+    const budget = new RunBudget(
+      state.openKeyedStore({
+        namespace: `${CHANNEL_ID}:budget`,
+        maxEntries: 64,
+      }) as BreakerStore,
+      `${CHANNEL_ID}:${ctx.accountId}`,
+      limits,
+    );
+    await budget.hydrate();
 
     const minIdentifierAuthentication = config.minIdentifierAuthentication ?? "asserted";
     const allowFrom = (config.allowFrom ?? []).map((entry) => String(entry));
@@ -235,17 +253,35 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
         ...deps,
         onDropped: async (messages) => {
           for (const entry of messages) {
-            quarantineMessage(entry.message.messageId, entry.decision.reason);
+            quarantineMessage(quarantineKey, entry.message.messageId, entry.decision.reason);
           }
-          await quarantineStore.register(quarantineKey, quarantineSnapshot());
+          await quarantineStore.register(quarantineKey, quarantineSnapshot(quarantineKey));
         },
         onAdmitted: async (messages) => {
-          // Tests and embedders can take over delivery entirely.
-          if (admittedHandler) {
-            await admittedHandler(messages);
-            return;
-          }
+          let completed = 0;
           for (const message of messages) {
+            // Checked per message, not once per batch. A single check would let a batch of
+            // 25 run against a budget with 1 left, which is not a cap. Ahead of the
+            // embedder override too, so taking over delivery cannot take over the cap.
+            if (!budget.check().allowed) {
+              return { completed };
+            }
+            // Spend before the run, not after: a run that throws still consumed a model
+            // call, and a breaker that only counts successes cannot bound a crash loop.
+            const spend = await budget.consume();
+            if (!spend.persisted) {
+              ctx.log?.warn?.(
+                `apple-mail: agent-run budget not persisted (${String(spend.error)}); the cap ` +
+                  `still holds for this process but will not survive a restart`,
+              );
+            }
+            // Tests and embedders can take over delivery, one message at a time so the
+            // budget and the partial cursor still apply to them.
+            if (admittedHandler) {
+              await admittedHandler([message]);
+              completed += 1;
+              continue;
+            }
             await dispatchAdmittedMessage(
               message,
               {
@@ -274,12 +310,25 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
                 sessionPrefix: `${CHANNEL_ID}:${ctx.accountId}`,
               },
             );
+            completed += 1;
           }
+          return { completed };
         },
         onError: (error) => ctx.log?.warn?.(`apple-mail poll failed: ${String(error)}`),
-        onTruncated: ({ mailbox, limit }) =>
+        checkBudget: () => budget.check(),
+        onThrottled: ({ window, retryAtMs, pending }) =>
           ctx.log?.warn?.(
-            `apple-mail: ${mailbox} had more than ${limit} unread messages; some were not read this cycle`,
+            `apple-mail: circuit breaker open (${window} limit of ` +
+              `${window === "day" ? limits.perDay : limits.perHour} agent runs reached); ` +
+              `holding ${pending} message(s)` +
+              (retryAtMs ? ` until ${new Date(retryAtMs).toISOString()}` : ""),
+          ),
+        // Informational now, not a warning: the page is the oldest unprocessed mail, so a
+        // full one means the backlog is still draining, not that anything was skipped.
+        onTruncated: ({ mailbox, limit }) =>
+          ctx.log?.info?.(
+            `apple-mail: ${mailbox} returned a full page of ${limit}; more unprocessed mail ` +
+              `remains and will be read next cycle`,
           ),
       },
       {
