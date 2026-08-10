@@ -10,12 +10,14 @@ enum EnvelopeIndexError: Error, LocalizedError {
     case notAvailable(String)
     case queryFailed(String)
     case notFound(String)
+    case ambiguous(String)
 
     var errorDescription: String? {
         switch self {
         case .notAvailable(let msg): return msg
         case .queryFailed(let msg): return msg
         case .notFound(let msg): return msg
+        case .ambiguous(let msg): return msg
         }
     }
 }
@@ -26,6 +28,9 @@ final class EnvelopeIndex {
     private var db: OpaquePointer?
     /// e.g. ~/Library/Mail/V10
     let versionDir: URL
+    private let accountsDatabasePath: URL
+    /// nil = not yet probed or the probe itself failed; true/false = determined.
+    private var labelsTablePresent: Bool?
 
     // MARK: - Discovery / lifecycle
 
@@ -54,11 +59,19 @@ final class EnvelopeIndex {
                 "Envelope Index not found or not readable under ~/Library/Mail/V*. "
                 + "The SQLite read path requires Full Disk Access.")
         }
-        return try EnvelopeIndex(databasePath: dbPath)
+        return try EnvelopeIndex(
+            databasePath: dbPath,
+            accountsDatabasePath: accountsStorePath(home: home))
     }
 
-    init(databasePath: URL) throws {
+    private static func accountsStorePath(home: URL) -> URL {
+        home.appendingPathComponent("Library/Accounts/Accounts4.sqlite")
+    }
+
+    init(databasePath: URL, accountsDatabasePath: URL? = nil) throws {
         versionDir = databasePath.deletingLastPathComponent().deletingLastPathComponent()
+        self.accountsDatabasePath = accountsDatabasePath
+            ?? Self.accountsStorePath(home: FileManager.default.homeDirectoryForCurrentUser)
         var handle: OpaquePointer?
         let rc = sqlite3_open_v2(databasePath.path, &handle, SQLITE_OPEN_READONLY, nil)
         guard rc == SQLITE_OK, let handle else {
@@ -145,18 +158,36 @@ final class EnvelopeIndex {
     /// Account UUID -> (displayName, userName) via the system Accounts store
     /// (same Full Disk Access umbrella as the mail directory). Best-effort:
     /// returns an empty map when unreadable, and callers fall back to UUIDs.
-    private var cachedAccountNames: [String: (name: String, userName: String?)]?
+    private var cachedAccountNames: [String: (
+        name: String,
+        userName: String?,
+        logicalAccountID: String
+    )]?
 
-    func accountNames() -> [String: (name: String, userName: String?)] {
+    func accountNames() -> [String: (
+        name: String,
+        userName: String?,
+        logicalAccountID: String
+    )] {
         if let cachedAccountNames { return cachedAccountNames }
-        var map: [String: (name: String, userName: String?)] = [:]
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Accounts/Accounts4.sqlite").path
+        var map: [String: (name: String, userName: String?, logicalAccountID: String)] = [:]
+        let path = accountsDatabasePath.path
         var handle: OpaquePointer?
         if sqlite3_open_v2(path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let handle {
             defer { sqlite3_close_v2(handle) }
             var stmt: OpaquePointer?
-            let sql = "SELECT ZIDENTIFIER, ZACCOUNTDESCRIPTION, ZUSERNAME FROM ZACCOUNT WHERE ZIDENTIFIER IS NOT NULL"
+            // Mail's mailbox URLs are hosted by the *child* (per-dataclass) account row,
+            // whose own description and username are NULL for IMAP providers (Google,
+            // Yahoo, iCloud); the human-facing values live on the parent. Fall back to it.
+            let sql = """
+                SELECT c.ZIDENTIFIER,
+                       COALESCE(c.ZACCOUNTDESCRIPTION, p.ZACCOUNTDESCRIPTION),
+                       COALESCE(c.ZUSERNAME, p.ZUSERNAME),
+                       COALESCE(p.ZIDENTIFIER, c.ZIDENTIFIER)
+                FROM ZACCOUNT c
+                LEFT JOIN ZACCOUNT p ON c.ZPARENTACCOUNT = p.Z_PK
+                WHERE c.ZIDENTIFIER IS NOT NULL
+                """
             if sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
                 defer { sqlite3_finalize(stmt) }
                 while sqlite3_step(stmt) == SQLITE_ROW {
@@ -164,7 +195,12 @@ final class EnvelopeIndex {
                     let uuid = String(cString: idText)
                     let name = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
                     let user = sqlite3_column_text(stmt, 2).map { String(cString: $0) }
-                    map[uuid] = (name: name ?? uuid, userName: user)
+                    let logicalAccountID = sqlite3_column_text(stmt, 3)
+                        .map { String(cString: $0) } ?? uuid
+                    map[uuid] = (
+                        name: name ?? uuid,
+                        userName: user,
+                        logicalAccountID: logicalAccountID)
                 }
             }
         } else if let handle {
@@ -180,11 +216,37 @@ final class EnvelopeIndex {
         let target = name.lowercased()
         let names = accountNames()
         let allUUIDs = Set(try mailboxes().map { $0.accountUUID })
-        return allUUIDs.filter { uuid in
-            if uuid.lowercased() == target { return true }
-            guard let entry = names[uuid] else { return false }
-            return entry.name.lowercased() == target || entry.userName?.lowercased() == target
-        }.sorted()
+        if let exactUUID = allUUIDs.first(where: { $0.lowercased() == target }) {
+            return [exactUUID]
+        }
+
+        let displayNameMatches = allUUIDs.filter {
+            names[$0]?.name.lowercased() == target
+        }
+        if !displayNameMatches.isEmpty {
+            return try accountUUIDsWithinOneLogicalAccount(
+                displayNameMatches, metadata: names, requestedName: name)
+        }
+
+        let userNameMatches = allUUIDs.filter {
+            names[$0]?.userName?.lowercased() == target
+        }
+        return try accountUUIDsWithinOneLogicalAccount(
+            userNameMatches, metadata: names, requestedName: name)
+    }
+
+    private func accountUUIDsWithinOneLogicalAccount(
+        _ matches: Set<String>,
+        metadata: [String: (name: String, userName: String?, logicalAccountID: String)],
+        requestedName: String
+    ) throws -> [String] {
+        let logicalAccountIDs = Set(matches.compactMap { metadata[$0]?.logicalAccountID })
+        guard logicalAccountIDs.count <= 1 else {
+            throw EnvelopeIndexError.ambiguous(
+                "Account matches multiple logical accounts: \(requestedName). "
+                + "Use the display name or account UUID instead.")
+        }
+        return matches.sorted()
     }
 
     // MARK: - Messages
@@ -222,13 +284,20 @@ final class EnvelopeIndex {
 
     func messages(filter: MessageFilter, limit: Int) throws -> [[String: Any]] {
         var conditions = ["m.deleted = 0", "g.message_id_header IS NOT NULL"]
+        var selectedColumns = Self.messageColumns
+        var selectedColumnBinds: [Bind] = []
         var binds: [Bind] = []
 
         if let rowIDs = filter.mailboxRowIDs {
-            guard !rowIDs.isEmpty else { return [] }
-            let placeholders = rowIDs.map { _ in "?" }.joined(separator: ",")
-            conditions.append("m.mailbox IN (\(placeholders))")
-            binds.append(contentsOf: rowIDs.map { Bind.int($0) })
+            let includeLabels = anyLabelRows(mailboxRowIDs: rowIDs)
+            guard let scope = mailboxScopeClause(rowIDs: rowIDs, includeLabels: includeLabels) else {
+                return [] // an empty mailbox scope selects nothing
+            }
+            conditions.append(scope.sql)
+            binds.append(contentsOf: scope.rowIDBinds.map { Bind.int($0) })
+            selectedColumns += ", \(scope.logicalMailboxSQL) AS logical_mailbox_rowid"
+            selectedColumnBinds.append(
+                contentsOf: scope.logicalMailboxRowIDBinds.map { Bind.int($0) })
         }
         if filter.unreadOnly { conditions.append("m.read = 0") }
         if filter.flaggedOnly { conditions.append("m.flagged = 1") }
@@ -258,14 +327,14 @@ final class EnvelopeIndex {
         }
 
         let sql = """
-            SELECT \(Self.messageColumns)
+            SELECT \(selectedColumns)
             \(Self.messageJoins)
             WHERE \(conditions.joined(separator: " AND "))
             ORDER BY m.date_received \(filter.oldestFirst ? "ASC" : "DESC")
             LIMIT ?
             """
         binds.append(.int(Int64(limit)))
-        return try query(sql, binds)
+        return try query(sql, selectedColumnBinds + binds)
     }
 
     /// All non-deleted copies of a message by RFC 2822 Message-ID, newest first.
@@ -307,6 +376,33 @@ final class EnvelopeIndex {
     func messageCount() throws -> Int {
         let rows = try query("SELECT COUNT(*) AS n FROM messages WHERE deleted = 0")
         return Int(rows.first?["n"] as? Int64 ?? 0)
+    }
+
+    /// Whether this Envelope Index has Mail's Gmail `labels` table (absent on installs
+    /// with no Gmail-style account). Probed once; only an answer is cached. A failed
+    /// probe reports `true`: wrongly including the arm fails loudly at prepare, wrongly
+    /// dropping it succeeds with zero rows that read as an empty mailbox.
+    private func hasLabelsTable() -> Bool {
+        if let cached = labelsTablePresent { return cached }
+        guard let rows = try? query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'labels'")
+        else { return true }  // probe failed: include the arm, and do not cache
+        let present = !rows.isEmpty
+        labelsTablePresent = present
+        return present
+    }
+
+    /// Whether any of these mailboxes carry label memberships (covering-index probe).
+    /// When none do, the arm stays off and non-Gmail queries keep their original plan.
+    /// As in `hasLabelsTable`, a failed probe reports `true` rather than risk a silent zero.
+    private func anyLabelRows(mailboxRowIDs: [Int64]) -> Bool {
+        guard !mailboxRowIDs.isEmpty, hasLabelsTable() else { return false }
+        let placeholders = mailboxRowIDs.map { _ in "?" }.joined(separator: ",")
+        guard let rows = try? query(
+            "SELECT 1 AS present FROM labels WHERE mailbox_id IN (\(placeholders)) LIMIT 1",
+            mailboxRowIDs.map { Bind.int($0) })
+        else { return true }  // probe failed: include the arm
+        return !rows.isEmpty
     }
 
     // MARK: - .emlx location

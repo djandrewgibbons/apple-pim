@@ -82,6 +82,41 @@ func escapeLikePattern(_ text: String) -> String {
         .replacingOccurrences(of: "_", with: "\\_")
 }
 
+/// SQL scope for a set of mailbox ROWIDs, including the projection that identifies the
+/// logical mailbox matched by the scope. `nil` means an empty scope selects nothing.
+/// Gmail stores the physical copy under [Gmail]/All Mail and folder membership in
+/// `labels`, so the label arm selects IDs separately and keeps both branches indexable.
+func mailboxScopeClause(rowIDs: [Int64], includeLabels: Bool) -> (
+    sql: String,
+    rowIDBinds: [Int64],
+    logicalMailboxSQL: String,
+    logicalMailboxRowIDBinds: [Int64]
+)? {
+    guard !rowIDs.isEmpty else { return nil }
+    let placeholders = rowIDs.map { _ in "?" }.joined(separator: ",")
+    guard includeLabels else {
+        return (
+            sql: "m.mailbox IN (\(placeholders))",
+            rowIDBinds: rowIDs,
+            logicalMailboxSQL: "m.mailbox",
+            logicalMailboxRowIDBinds: [])
+    }
+    return (
+        sql: "m.ROWID IN ("
+            + "SELECT scoped.ROWID FROM messages scoped "
+            + "WHERE scoped.mailbox IN (\(placeholders)) "
+            + "UNION ALL "
+            + "SELECT l.message_id FROM labels l "
+            + "WHERE l.mailbox_id IN (\(placeholders)))",
+        rowIDBinds: rowIDs + rowIDs,
+        logicalMailboxSQL: "CASE WHEN m.mailbox IN (\(placeholders)) THEN m.mailbox "
+            + "ELSE (SELECT l.mailbox_id FROM labels l "
+            + "WHERE l.message_id = m.ROWID AND l.mailbox_id IN (\(placeholders)) "
+            + "ORDER BY l.mailbox_id LIMIT 1) END",
+        logicalMailboxRowIDBinds: rowIDs + rowIDs
+    )
+}
+
 /// Mailbox names Mail.app treats as junk destinations.
 private let junkMailboxNames: Set<String> = ["Junk", "Junk Mail", "Junk E-mail", "Junk Email", "Spam", "Bulk Mail"]
 
