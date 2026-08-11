@@ -132,7 +132,7 @@ The OpenClaw plugin is published as `apple-pim-cli` on both ClawHub and NPM.
 
 ### Automated (CI)
 
-ClawHub publishing is automated via GitHub Actions (`.github/workflows/publish-clawhub.yml`). To publish a new version:
+ClawHub, NPM, and Homebrew publishing are automated via GitHub Actions when a version tag is pushed. The tag workflows do not create a GitHub Release, so that remains an explicit release step.
 
 ```bash
 # 1. Follow the publishing checklist below
@@ -167,11 +167,11 @@ npm publish
 
 ### Publishing checklist
 
-1. Bump version in both `openclaw/package.json` and `mcp-server/package.json`
-2. Update `version` in `openclaw/openclaw.plugin.json` to match
-3. Rebuild `mcp-server/dist/server.js`
-4. Commit, merge to main, tag the GitHub release
-5. ClawHub publishes automatically via CI on tag push (or use manual script)
+1. Run `scripts/bump-version.sh X.Y.Z` to update all five version sources and rebuild `mcp-server/dist/server.js`
+2. Run `scripts/check-versions.sh` and the relevant tests and builds
+3. Commit the release bump, create an annotated `vX.Y.Z` tag, then push the commit and tag
+4. Create the GitHub Release explicitly with release notes; no workflow creates it
+5. Verify the NPM, ClawHub, and Homebrew workflows and confirm the new version in each registry
 
 ### Verify / Install
 

@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import PIMConfig
 
+/// Process environment variables are shared across every concurrently running
+/// Swift Testing suite in this test process. `.serialized` only orders tests
+/// within a single suite, so environment-mutating suites must also share this
+/// lock with one another.
+enum ProcessEnvironmentTestLock {
+    static let lock = NSLock()
+}
+
 @Suite("ConfigLoader")
 struct ConfigLoaderTests {
 
@@ -237,6 +245,9 @@ struct ConfigLoaderEnvTests {
 
     @Test("APPLE_PIM_CONFIG_DIR overrides default config directory")
     func testConfigDirEnvOverride() throws {
+        ProcessEnvironmentTestLock.lock.lock()
+        defer { ProcessEnvironmentTestLock.lock.unlock() }
+
         let tmpDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("pim-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
@@ -263,6 +274,9 @@ struct ConfigLoaderEnvTests {
 
     @Test("loadProfile returns nil when profile file does not exist")
     func testLoadProfileReturnsNilForMissing() throws {
+        ProcessEnvironmentTestLock.lock.lock()
+        defer { ProcessEnvironmentTestLock.lock.unlock() }
+
         let tmpDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("pim-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)

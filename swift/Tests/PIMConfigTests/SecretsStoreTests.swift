@@ -14,6 +14,7 @@ struct SecretsStoreTests {
         let openclawPath: URL
 
         init() {
+            ProcessEnvironmentTestLock.lock.lock()
             let tmp = FileManager.default.temporaryDirectory
                 .appendingPathComponent("apple-pim-secrets-test-\(UUID().uuidString)")
             try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
@@ -33,6 +34,7 @@ struct SecretsStoreTests {
             unsetenv("APPLE_PIM_CONFIG_DIR")
             unsetenv("OPENCLAW_SECRETS_PATH")
             try? FileManager.default.removeItem(at: root)
+            ProcessEnvironmentTestLock.lock.unlock()
         }
 
         func writeOpenclawJSON(_ json: String) throws {
