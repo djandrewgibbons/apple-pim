@@ -32,10 +32,17 @@ SIGN_IDENTITY="${APPLE_PIM_SIGN_IDENTITY:--}"
 FORCE=false
 [[ "${1:-}" == "--force" ]] && FORCE=true
 
-if [[ ! -f "$SRC_DIR/Info.plist" || ! -f "$SRC_DIR/pim-helper" ]]; then
+if [[ ! -f "$SRC_DIR/Info.plist" || ! -f "$SRC_DIR/pim-helper" || ! -f "$SRC_DIR/launcher.c" ]]; then
     echo "build-helper-app: missing helper sources at $SRC_DIR" >&2
     exit 1
 fi
+
+# Hash of the launcher source that produced the installed binary. Written into
+# the bundle at build time so the freshness check below can tell whether the
+# compiled CFBundleExecutable is still current: the source is C and the install
+# is a binary, so they cannot be compared with cmp.
+LAUNCHER_STAMP_REL="Contents/Resources/.launcher-source-sha256"
+launcher_source_hash() { shasum -a 256 "$SRC_DIR/launcher.c" | awk '{print $1}'; }
 
 # True when the installed bundle's signature matches the requested identity.
 # Ad-hoc shows as `Signature=adhoc` (no Authority line); a certificate shows
@@ -58,11 +65,21 @@ installed_identity_matches() {
 # downgraded (which would drop the grants).
 if [[ "$FORCE" != true && -d "$APP_PATH" ]] \
     && cmp -s "$SRC_DIR/Info.plist" "$APP_PATH/Contents/Info.plist" \
-    && cmp -s "$SRC_DIR/pim-helper" "$APP_PATH/Contents/MacOS/pim-helper" \
+    && cmp -s "$SRC_DIR/pim-helper" "$APP_PATH/Contents/Resources/pim-helper.sh" \
+    && [[ "$(cat "$APP_PATH/$LAUNCHER_STAMP_REL" 2>/dev/null)" == "$(launcher_source_hash)" ]] \
     && codesign --verify "$APP_PATH" >/dev/null 2>&1 \
     && { [[ -z "${APPLE_PIM_SIGN_IDENTITY:-}" ]] || installed_identity_matches; }; then
     echo "PIMHelper.app is up to date at: $APP_PATH (leaving untouched to preserve TCC grants)"
     exit 0
+fi
+
+# Only required once we know a rebuild is actually happening. Checking earlier
+# would fail an otherwise-successful no-op install on a host without developer
+# tools, which is a regression against the pre-launcher behaviour.
+if ! command -v cc >/dev/null 2>&1; then
+    echo "build-helper-app: no C compiler found; install Xcode Command Line Tools" >&2
+    echo "build-helper-app: (xcode-select --install)" >&2
+    exit 1
 fi
 
 if [[ -d "$APP_PATH" ]]; then
@@ -82,10 +99,24 @@ if [[ -e "$APP_PATH" ]]; then
     fi
 fi
 
-mkdir -p "$APP_PATH/Contents/MacOS"
+mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$SRC_DIR/Info.plist" "$APP_PATH/Contents/Info.plist"
-cp "$SRC_DIR/pim-helper" "$APP_PATH/Contents/MacOS/pim-helper"
+
+# The dispatcher script lives in Resources, NOT as CFBundleExecutable: macOS
+# refuses to launch an .app whose main executable is a shell script (see
+# helper/launcher.c). CFBundleExecutable is a compiled launcher that re-execs
+# this script, so the bundle still becomes the TCC-responsible process.
+cp "$SRC_DIR/pim-helper" "$APP_PATH/Contents/Resources/pim-helper.sh"
+chmod +x "$APP_PATH/Contents/Resources/pim-helper.sh"
+
+# Build for the running architecture. -Os keeps the stub tiny; it does nothing
+# but resolve its own path and execv into /bin/zsh.
+cc -Os -Wall -Wextra -o "$APP_PATH/Contents/MacOS/pim-helper" "$SRC_DIR/launcher.c"
 chmod +x "$APP_PATH/Contents/MacOS/pim-helper"
+
+# Record which launcher source built this binary so the freshness check above
+# can detect launcher.c changes on a later run.
+launcher_source_hash > "$APP_PATH/$LAUNCHER_STAMP_REL"
 
 # Sign the bundle. --force overwrites any prior signature; --deep walks
 # contents (the bundle is shallow but this future-proofs nested files).
