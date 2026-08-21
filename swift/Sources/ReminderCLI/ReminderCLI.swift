@@ -22,6 +22,7 @@ struct ReminderCLI: AsyncParsableCommand {
             BatchCreateReminder.self,
             BatchCompleteReminder.self,
             BatchDeleteReminder.self,
+            RepairDates.self,
             ConfigCommand.self,
         ]
     )
@@ -190,9 +191,6 @@ func reminderToDict(_ reminder: EKReminder) -> [String: Any] {
     if let dueDate = reminder.dueDateComponents {
         dict["dueDate"] = dateComponentsToString(dueDate)
     }
-    if let startDate = reminder.startDateComponents {
-        dict["startDate"] = dateComponentsToString(startDate)
-    }
     if let notes = reminder.notes, !notes.isEmpty {
         dict["notes"] = notes
     }
@@ -222,6 +220,52 @@ func dateComponentsToString(_ components: DateComponents) -> String {
     }
 
     return dateStr
+}
+
+/// Sets a reminder's date, keeping `startDateComponents` mirrored to
+/// `dueDateComponents`.
+///
+/// Reminders.app writes both fields together and offers no separate "start
+/// date" control, but EventKit does not mirror them for you. Writing due
+/// alone leaves whatever start date was there before, and a reminder that
+/// ends up with a start date but no due date renders as *dateless* in
+/// Reminders.app while still occupying a date slot in EventKit. Always go
+/// through this instead of assigning `dueDateComponents` directly.
+/// Sets a reminder's due date and mirrors `startDateComponents` to match.
+///
+/// Reminders.app writes both fields together and offers no separate "start
+/// date" control, but EventKit does not mirror them for you. Writing due
+/// alone leaves whatever start date was there before, and a reminder that
+/// ends up with a start date but no due date renders as *dateless* in
+/// Reminders.app. Always go through this instead of assigning
+/// `dueDateComponents` directly.
+func setReminderDueDate(_ reminder: EKReminder, to due: DateComponents?) {
+    reminder.dueDateComponents = due
+    reminder.startDateComponents = due.map { mirroredStart(from: $0) }
+}
+
+/// Whether a due-date string names a day with no time of day.
+///
+/// Matched with an anchored regex rather than `DateFormatter`, which happily
+/// parses a *prefix*: "2026-09-01 07:00" satisfies a "yyyy-MM-dd" formatter
+/// and would otherwise be misread as all-day.
+func isDateOnlyString(_ string: String) -> Bool {
+    let trimmed = string.trimmingCharacters(in: .whitespaces)
+    let patterns = [#"^\d{4}-\d{1,2}-\d{1,2}$"#, #"^\d{1,2}/\d{1,2}/\d{4}$"#]
+    return patterns.contains { trimmed.range(of: $0, options: .regularExpression) != nil }
+}
+
+/// Builds due-date components, keeping the all-day shape when the caller
+/// named a day without a time.
+///
+/// Reminders.app stores an all-day reminder as a due date carrying no hour or
+/// minute. Someone passing "2027-06-01" means the whole day, not midnight.
+func reminderDueComponents(from string: String) -> DateComponents? {
+    guard let date = parseDate(string) else { return nil }
+    let fields: Set<Calendar.Component> = isDateOnlyString(string)
+        ? [.year, .month, .day]
+        : [.year, .month, .day, .hour, .minute]
+    return Calendar.current.dateComponents(fields, from: date)
 }
 
 func ruleToDict(_ rule: EKRecurrenceRule) -> [String: Any] {
@@ -736,8 +780,8 @@ struct CreateReminder: AsyncParsableCommand {
         reminder.title = title
         reminder.calendar = try resolveTargetList(explicit: list, config: config)
 
-        if let dueStr = due, let dueDate = parseDate(dueStr) {
-            reminder.dueDateComponents = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: dueDate)
+        if let dueStr = due, let components = reminderDueComponents(from: dueStr) {
+            setReminderDueDate(reminder, to: components)
         }
 
         if let n = notes {
@@ -864,8 +908,8 @@ struct UpdateReminder: AsyncParsableCommand {
             reminder.title = newTitle
         }
         if let newDue = due {
-            if let dueDate = parseDate(newDue) {
-                reminder.dueDateComponents = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: dueDate)
+            if let components = reminderDueComponents(from: newDue) {
+                setReminderDueDate(reminder, to: components)
             }
         }
         if let newNotes = notes {
@@ -983,10 +1027,8 @@ func decodeBatchReminders(_ json: String) throws -> [BatchReminderInput] {
 }
 
 func batchReminderDueDateComponents(_ due: String?) -> DateComponents? {
-    guard let due, let dueDate = parseDate(due) else {
-        return nil
-    }
-    return Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: dueDate)
+    guard let due else { return nil }
+    return reminderDueComponents(from: due)
 }
 
 struct BatchCreateReminder: AsyncParsableCommand {
@@ -1015,7 +1057,7 @@ struct BatchCreateReminder: AsyncParsableCommand {
                 reminder.title = reminderInput.title
                 reminder.calendar = try resolveTargetList(explicit: reminderInput.list, config: config)
 
-                reminder.dueDateComponents = batchReminderDueDateComponents(reminderInput.due)
+                setReminderDueDate(reminder, to: batchReminderDueDateComponents(reminderInput.due))
 
                 if let n = reminderInput.notes {
                     reminder.notes = n
@@ -1242,6 +1284,143 @@ struct BatchDeleteReminder: AsyncParsableCommand {
 }
 
 // MARK: - Config Command
+
+// MARK: - Repair Dates
+
+/// Returns the `startDateComponents` value that should accompany `due`.
+///
+/// Reminders.app stores an all-day reminder as a due date with no time and a
+/// start date at 00:00, so an exact component copy is not quite right. This
+/// mirrors the day fields and fills in midnight when the due date carries no
+/// time of day.
+func mirroredStart(from due: DateComponents) -> DateComponents {
+    var start = DateComponents()
+    start.year = due.year
+    start.month = due.month
+    start.day = due.day
+    start.hour = due.hour ?? 0
+    start.minute = due.minute ?? 0
+    // Carry the due date's time zone across. Handing EventKit a start date
+    // with no time zone makes it renormalize BOTH fields into local time on
+    // save, which silently rewrites the due date's wall-clock representation.
+    start.timeZone = due.timeZone
+    return start
+}
+
+/// Whether two date components would be stored identically by EventKit.
+///
+/// The time zone is part of the comparison. Matching wall-clock fields with
+/// differing zones is exactly the state that makes EventKit renormalize both
+/// the start and due dates on the next save, so `repair-dates` must treat it
+/// as drift rather than skipping it.
+func sameStoredDate(_ a: DateComponents?, _ b: DateComponents?) -> Bool {
+    guard let a, let b else { return a == nil && b == nil }
+    return a.year == b.year && a.month == b.month && a.day == b.day
+        && (a.hour ?? 0) == (b.hour ?? 0) && (a.minute ?? 0) == (b.minute ?? 0)
+        && a.timeZone == b.timeZone
+}
+
+/// Repairs reminders whose start date drifted away from their due date.
+///
+/// Versions of this CLI before the `setReminderDate` fix wrote
+/// `dueDateComponents` without touching `startDateComponents`, leaving stale
+/// start dates behind. Reminders that ended up with a start date and no due
+/// date render as *dateless* in Reminders.app, and some third-party clients
+/// bucket them as due today.
+struct RepairDates: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "repair-dates",
+        abstract: "Re-sync reminder start dates to their due dates (dry run unless --apply)"
+    )
+
+    @OptionGroup var pimOptions: PIMOptions
+
+    @Flag(name: .long, help: "Write the changes. Without this the command only reports.")
+    var apply: Bool = false
+
+    @Flag(name: .long, help: "Include completed reminders")
+    var completed: Bool = false
+
+    func run() async throws {
+        try await requestReminderAccess()
+
+        let config = pimOptions.loadConfig()
+        var calendars: [EKCalendar]?
+        if config.reminders.mode != .all {
+            calendars = allowedLists(config: config)
+        }
+
+        let predicate = eventStore.predicateForReminders(in: calendars)
+        let reminders = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[EKReminder], Error>) in
+            eventStore.fetchReminders(matching: predicate) { continuation.resume(returning: $0 ?? []) }
+        }
+
+        var repaired: [[String: Any]] = []
+        var orphans: [[String: Any]] = []
+        var errors: [[String: Any]] = []
+        var scanned = 0
+
+        for reminder in reminders where completed || !reminder.isCompleted {
+            scanned += 1
+
+            // Start date but no due date: Reminders.app shows these as dateless.
+            // Picking a due date is a judgement call, so only report them.
+            guard let due = reminder.dueDateComponents else {
+                if let start = reminder.startDateComponents {
+                    orphans.append([
+                        "id": reminder.calendarItemIdentifier,
+                        "title": reminder.title ?? "",
+                        "list": reminder.calendar?.title ?? "",
+                        "startDate": dateComponentsToString(start)
+                    ])
+                }
+                continue
+            }
+
+            let desired = mirroredStart(from: due)
+            if sameStoredDate(reminder.startDateComponents, desired) { continue }
+
+            var change: [String: Any] = [
+                "id": reminder.calendarItemIdentifier,
+                "title": reminder.title ?? "",
+                "list": reminder.calendar?.title ?? "",
+                "dueDate": dateComponentsToString(due),
+                "oldStartDate": reminder.startDateComponents.map { dateComponentsToString($0) } ?? "none",
+                "newStartDate": dateComponentsToString(desired),
+                "dueTimeZone": due.timeZone?.identifier ?? "none",
+                "oldStartTimeZone": reminder.startDateComponents?.timeZone?.identifier ?? "none",
+                "recurring": reminder.hasRecurrenceRules
+            ]
+
+            if apply {
+                reminder.startDateComponents = desired
+                do {
+                    try eventStore.save(reminder, commit: false)
+                } catch {
+                    change["error"] = error.localizedDescription
+                    errors.append(change)
+                    continue
+                }
+            }
+            repaired.append(change)
+        }
+
+        if apply && !repaired.isEmpty {
+            try eventStore.commit()
+        }
+
+        outputJSON([
+            "success": errors.isEmpty,
+            "applied": apply,
+            "scanned": scanned,
+            "repairedCount": repaired.count,
+            "repaired": repaired,
+            "orphanedCount": orphans.count,
+            "orphaned": orphans,
+            "errors": errors
+        ])
+    }
+}
 
 struct ConfigCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
