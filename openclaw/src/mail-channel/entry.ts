@@ -35,6 +35,11 @@ import {
 } from "../../lib/mail-quarantine.js";
 import { dispatchAdmittedMessage } from "./dispatch.ts";
 import { dispatchReplyWithBufferedBlockDispatcher } from "openclaw/plugin-sdk/reply-dispatch-runtime";
+import {
+  channelBlockedPatch,
+  channelReadyPatch,
+  channelStoppedPatch,
+} from "openclaw/plugin-sdk/gateway-runtime";
 
 /** Account shape this channel resolves from config. */
 export type ResolvedAppleMailAccount = {
@@ -241,12 +246,19 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
       );
       await budget.hydrate();
     } catch (error) {
-      ctx.log?.error?.(
+      const message =
         `apple-mail: durable storage unavailable (${String(error)}). The channel needs it for ` +
           `its poll cursor, thread records, quarantine, and run budget, and will not run ` +
           `without them: a lost cursor reprocesses the mailbox and a lost quarantine ` +
           `un-blocks refused senders. Check that ${storeDirectory()} is writable and that ` +
-          `this Node build has node:sqlite (22.13+).`,
+        `this Node build has node:sqlite (22.13+).`;
+      ctx.log?.error?.(message);
+      ctx.setStatus(
+        channelBlockedPatch(message, {
+          accountId: ctx.accountId,
+          running: true,
+          connected: false,
+        }),
       );
       // Held rather than returned. A returning `startAccount` reads as an exited channel and
       // is restarted every few seconds; none of the causes above are fixed by retrying.
@@ -257,6 +269,7 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
         }
         ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true });
       });
+      ctx.setStatus(channelStoppedPatch({ accountId: ctx.accountId, lastStopAt: Date.now() }));
       return;
     }
 
@@ -400,10 +413,15 @@ const gateway: NonNullable<ChannelPlugin<ResolvedAppleMailAccount>["gateway"]> =
     );
 
     loops.set(ctx.accountId, loop);
+    // The poll loop is now armed and owns this account until abort. Core initializes every
+    // channel as `starting`; without this explicit handoff a healthy long-lived loop remains
+    // permanently indistinguishable from one that never finished initialization.
+    ctx.setStatus(channelReadyPatch({ accountId: ctx.accountId }));
     // Awaited, not fired and forgotten. The gateway treats a `startAccount` that returns as
     // an exited channel and restarts it every few seconds; the loop already runs until the
     // abort signal, so awaiting it is what "the channel is up" means here.
     await loop;
+    ctx.setStatus(channelStoppedPatch({ accountId: ctx.accountId, lastStopAt: Date.now() }));
   },
 
   stopAccount: async (ctx) => {
