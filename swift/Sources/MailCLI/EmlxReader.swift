@@ -11,6 +11,8 @@ struct EmlxMessage {
     let headers: [(name: String, value: String)]
     /// Best-effort plain-text body.
     let content: String
+    /// Best-effort decoded HTML body, when the message contains one.
+    let htmlContent: String?
 
     func header(_ name: String) -> String? {
         headers.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.value
@@ -64,7 +66,8 @@ func parseRFC822(data: Data) -> EmlxMessage {
     let contentType = headers.first { $0.name.caseInsensitiveCompare("Content-Type") == .orderedSame }?.value ?? "text/plain"
     let encoding = headers.first { $0.name.caseInsensitiveCompare("Content-Transfer-Encoding") == .orderedSame }?.value ?? ""
     let body = extractBody(bodyData, contentType: contentType, transferEncoding: encoding)
-    return EmlxMessage(rawHeaders: rawHeaders, headers: headers, content: body)
+    let html = extractHTMLBody(bodyData, contentType: contentType, transferEncoding: encoding)
+    return EmlxMessage(rawHeaders: rawHeaders, headers: headers, content: body, htmlContent: html)
 }
 
 // MARK: - Header parsing
@@ -136,6 +139,19 @@ private func extractBody(_ data: Data, contentType: String, transferEncoding: St
         return stripHTMLTags(text)
     }
     return text
+}
+
+/// Extract a decoded HTML body without stripping its formatting. This shares
+/// the MIME parser used by the SQLite read path rather than maintaining a
+/// second, reply-only MIME implementation.
+private func extractHTMLBody(_ data: Data, contentType: String, transferEncoding: String) -> String? {
+    let lowerType = contentType.lowercased()
+    if lowerType.hasPrefix("multipart/"), let boundary = mimeParameter(contentType, "boundary") {
+        return findPart(in: splitMultipart(data, boundary: boundary), matching: "text/html")
+    }
+    guard lowerType.hasPrefix("text/html") else { return nil }
+    let charset = mimeParameter(contentType, "charset") ?? "utf-8"
+    return decodeText(decodeTransferEncoding(data, encoding: transferEncoding), charset: charset)
 }
 
 private func findPart(in parts: [Data], matching type: String) -> String? {

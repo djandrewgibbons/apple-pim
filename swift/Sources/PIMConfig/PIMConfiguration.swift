@@ -96,6 +96,8 @@ public struct IMAPDefaults: Codable, Equatable, Sendable {
     /// Mailbox to APPEND into. iCloud: `"Sent Messages"`, Gmail: `"[Gmail]/Sent Mail"`,
     /// generic: `"Sent"`.
     public var sentFolder: String?
+    /// Mailbox to APPEND reviewable reply drafts into.
+    public var draftsFolder: String?
     /// When set, overrides the host-based default for whether APPEND runs.
     public var appendSent: Bool?
 
@@ -105,6 +107,7 @@ public struct IMAPDefaults: Codable, Equatable, Sendable {
         username: String? = nil,
         secretKey: String? = nil,
         sentFolder: String? = nil,
+        draftsFolder: String? = nil,
         appendSent: Bool? = nil
     ) {
         self.host = host
@@ -112,6 +115,7 @@ public struct IMAPDefaults: Codable, Equatable, Sendable {
         self.username = username
         self.secretKey = secretKey
         self.sentFolder = sentFolder
+        self.draftsFolder = draftsFolder
         self.appendSent = appendSent
     }
 
@@ -119,6 +123,7 @@ public struct IMAPDefaults: Codable, Equatable, Sendable {
         case host, port, username
         case secretKey = "secret_key"
         case sentFolder = "sent_folder"
+        case draftsFolder = "drafts_folder"
         case appendSent = "append_sent"
     }
 }

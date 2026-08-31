@@ -28,8 +28,11 @@ public enum IMAPClientError: Error, CustomStringConvertible {
 /// Gmail `"[Gmail]/Sent Mail"`, generic IMAP `"Sent"`. The caller supplies the
 /// resolved folder via `sentFolder`.
 ///
-/// APPEND failures are NOT fatal to the overall send — the message was already
-/// delivered by SMTP. Callers surface APPEND errors as a non-fatal warning.
+/// `appendToSent` failures are NOT fatal to the overall send — the message was
+/// already delivered by SMTP, so callers surface those as a non-fatal warning.
+/// `appendToDrafts` failures ARE fatal: the APPEND is the only thing that
+/// persists the draft, so a caller that swallowed it would report success for a
+/// draft that does not exist.
 public struct IMAPClient: Sendable {
 
     public struct Credentials: Sendable {
@@ -74,9 +77,30 @@ public struct IMAPClient: Sendable {
         try await runAppend(transport: transport, rawMessage: rawMessage, internalDate: internalDate)
     }
 
+    /// Open an implicit-TLS connection and APPEND a reviewable draft with the
+    /// standard IMAP Draft flag. The folder remains caller-configurable because
+    /// providers do not agree on its name.
+    public func appendToDrafts(_ rawMessage: Data, internalDate: Date, folder: String) async throws {
+        let transport = try await NWConnectionTransport(host: host, port: port, timeout: timeout)
+        defer { Task { await transport.close() } }
+        try await runAppend(
+            transport: transport,
+            rawMessage: rawMessage,
+            internalDate: internalDate,
+            folder: folder,
+            flags: "(\\Draft)"
+        )
+    }
+
     /// Testable entry point — caller provides the transport. Drives the tagged
     /// IMAP conversation: greeting → LOGIN → APPEND (literal) → LOGOUT.
-    public func runAppend(transport: SMTPTransport, rawMessage: Data, internalDate: Date) async throws {
+    public func runAppend(
+        transport: SMTPTransport,
+        rawMessage: Data,
+        internalDate: Date,
+        folder: String? = nil,
+        flags: String = "(\\Seen)"
+    ) async throws {
         // 1. Greeting (untagged "* OK ...").
         let greeting = try await receive(transport)
         guard greeting.uppercased().contains("OK") else {
@@ -106,7 +130,8 @@ public struct IMAPClient: Sendable {
         let appendTag = "A2"
         let dateArg = Self.imapInternalDate(internalDate)
         let literalLength = rawMessage.count
-        let appendCmd = "\(appendTag) APPEND \(Self.quoteIMAP(sentFolder)) (\\Seen) \"\(dateArg)\" {\(literalLength)}"
+        let targetFolder = folder ?? sentFolder
+        let appendCmd = "\(appendTag) APPEND \(Self.quoteIMAP(targetFolder)) \(flags) \"\(dateArg)\" {\(literalLength)}"
         try await writeLine(transport, appendCmd)
 
         let continuation = try await receive(transport)
