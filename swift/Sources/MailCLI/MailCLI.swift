@@ -2066,6 +2066,11 @@ struct ReplyMessage: AsyncParsableCommand {
 
         // Step 1: Use JXA to find the message by RFC 2822 messageId and get its numeric Apple Mail ID
         let findHelper = findMessageJXA(targetId: id, mailbox: mailbox, account: account)
+        // The body/source fetch is expensive and only the draft path quotes the original.
+        let draftFetch = draft ? """
+            try { originalContent = msg.content(); } catch (e) { lookupErrors.push("content: " + e); }
+            try { originalSource = msg.source(); } catch (e) { lookupErrors.push("source: " + e); }
+        """ : ""
         let lookupScript = """
         \(findHelper)
 
@@ -2076,9 +2081,13 @@ struct ReplyMessage: AsyncParsableCommand {
             const accountEmails = [];
             const toRecipients = [];
             const ccRecipients = [];
-            try { (msg.mailbox().account().emailAddresses() || []).forEach(e => { if (e) accountEmails.push(e); }); } catch (e) {}
-            try { msg.toRecipients().forEach(r => { const a = r.address(); if (a) toRecipients.push(a); }); } catch (e) {}
-            try { msg.ccRecipients().forEach(r => { const a = r.address(); if (a) ccRecipients.push(a); }); } catch (e) {}
+            const lookupErrors = [];
+            let originalContent = null;
+            let originalSource = null;
+            try { (msg.mailbox().account().emailAddresses() || []).forEach(e => { if (e) accountEmails.push(e); }); } catch (e) { lookupErrors.push("accountEmails: " + e); }
+            try { msg.toRecipients().forEach(r => { const a = r.address(); if (a) toRecipients.push(a); }); } catch (e) { lookupErrors.push("toRecipients: " + e); }
+            try { msg.ccRecipients().forEach(r => { const a = r.address(); if (a) ccRecipients.push(a); }); } catch (e) { lookupErrors.push("ccRecipients: " + e); }
+        \(draftFetch)
             JSON.stringify({
                 appleMailId: msg.id(),
                 account: msg.mailbox().account().name(),
@@ -2089,8 +2098,9 @@ struct ReplyMessage: AsyncParsableCommand {
                 accountEmails: accountEmails,
                 toRecipients: toRecipients,
                 ccRecipients: ccRecipients,
-                content: \(draft ? "msg.content()," : "null,"),
-                source: \(draft ? "msg.source()" : "null")
+                lookupErrors: lookupErrors,
+                content: originalContent,
+                source: originalSource
             });
         }
         """
@@ -2113,6 +2123,9 @@ struct ReplyMessage: AsyncParsableCommand {
         _ = mailboxName  // retained for diagnostics; no longer used to address the message
 
         if draft {
+            if let lookupErrors = dict["lookupErrors"] as? [String], !lookupErrors.isEmpty {
+                throw CLIError.jxaError("Mail lookup failed for draft reply: \(lookupErrors.joined(separator: "; "))")
+            }
             let enriched = withParsedAddresses(dict)
             let senderAddress = enriched["senderAddress"] as? String ?? ""
             let replyToAddress = enriched["replyToAddress"] as? String
@@ -2128,10 +2141,13 @@ struct ReplyMessage: AsyncParsableCommand {
                 configuredUsername: config.imap?.username ?? config.smtp?.username
             )
 
-            let source = dict["source"] as? String ?? ""
+            guard let source = dict["source"] as? String, !source.isEmpty else {
+                throw CLIError.jxaError("could not read the original message source for the draft")
+            }
             let parsed = parseRFC822(data: Data(source.utf8))
-            let originalPlain = (dict["content"] as? String) ?? parsed.content
-            let attribution = (dict["sender"] as? String) ?? senderAddress
+            let jxaContent = (dict["content"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let originalPlain = jxaContent ?? parsed.content
+            let attribution = (dict["sender"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? senderAddress
             let parentID = MIMEMessage.bracketed(id) ?? id
             var references = messageIDs(in: parsed.header("References"))
             if !references.contains(parentID) { references.append(parentID) }

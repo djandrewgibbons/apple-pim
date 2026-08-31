@@ -34,6 +34,7 @@ func buildReplyDraftEnvelope(
     }
 
     var seen = selfAddresses
+    seen.insert(from.lowercased())
     seen.insert(target.lowercased())
     var cc: [String] = []
     for address in originalTo + originalCc {
@@ -52,11 +53,49 @@ func htmlEscapeForReply(_ value: String) -> String {
         .replacingOccurrences(of: "\"", with: "&quot;")
 }
 
+/// The quoted body comes from an untrusted sender but is embedded in the draft the
+/// user reviews. A `<style>` block or a full `<html>` document would otherwise escape
+/// the blockquote and restyle or hide the user's own reply text.
+func sanitizeQuotedHTML(_ html: String) -> String {
+    var result = html
+    for element in ["script", "style", "head", "title"] {
+        result = result.replacingOccurrences(
+            of: "<\(element)\\b[^>]*>[\\s\\S]*?</\(element)\\s*>",
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+    }
+    if let body = firstCapture(in: result, pattern: "<body\\b[^>]*>([\\s\\S]*)</body\\s*>") {
+        result = body
+    }
+    for pattern in [
+        "<![^>]*>",
+        "</?html\\b[^>]*>",
+        "</?body\\b[^>]*>",
+        "<(link|meta|base)\\b[^>]*>",
+        "</?(script|style|head|title)\\b[^>]*>",
+    ] {
+        result = result.replacingOccurrences(
+            of: pattern,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+    }
+    return result.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func firstCapture(in value: String, pattern: String) -> String? {
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+    let range = NSRange(value.startIndex..., in: value)
+    guard let match = regex.firstMatch(in: value, range: range), match.numberOfRanges > 1 else { return nil }
+    return Range(match.range(at: 1), in: value).map { String(value[$0]) }
+}
+
 func buildReplyHTML(myText: String, attributionSender: String, originalHTML: String?, originalPlain: String) -> String {
     let myHTML = htmlEscapeForReply(myText).replacingOccurrences(of: "\n", with: "<br>\n")
-    let trimmedHTML = originalHTML?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let quoted = trimmedHTML?.isEmpty == false
-        ? trimmedHTML!
+    let sanitizedHTML = originalHTML.map(sanitizeQuotedHTML)
+    let quoted = sanitizedHTML?.isEmpty == false
+        ? sanitizedHTML!
         : htmlEscapeForReply(originalPlain).replacingOccurrences(of: "\n", with: "<br>\n")
     return """
     <div>\(myHTML)</div>
@@ -105,7 +144,10 @@ func resolveIMAPDraftAccount(config: PIMConfiguration, accountAddresses: [String
         throw CLIError.invalidInput("reply --draft requires imap.username or smtp.username")
     }
     let aliases = Set(accountAddresses.map { $0.lowercased() })
-    guard aliases.isEmpty || aliases.contains(username.lowercased()) else {
+    guard !aliases.isEmpty else {
+        throw CLIError.invalidInput("could not determine the source Mail account's addresses; refusing to draft without verifying the configured IMAP identity")
+    }
+    guard aliases.contains(username.lowercased()) else {
         throw CLIError.invalidInput("configured IMAP username does not match the source Mail account")
     }
 

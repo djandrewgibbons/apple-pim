@@ -548,7 +548,7 @@ mail-cli smtp-send --verbose --to you@example.com --from me@icloud.com \
 }
 ```
 
-Folder names differ by provider: iCloud uses `"Sent Messages"` / `"Drafts"`; Gmail uses `"[Gmail]/Sent Mail"` / `"[Gmail]/Drafts"`. If `imap.secret_key` is omitted, the SMTP password is reused (iCloud uses the same app-specific password for both). Sent-copy APPEND failures are **non-fatal** because the message was already delivered. Draft APPEND failures are fatal because no reviewable draft was created. Non-iCloud draft creation requires an explicit `imap.host` and matching source-account username.
+Folder names differ by provider: iCloud uses `"Sent Messages"` / `"Drafts"`; Gmail uses `"[Gmail]/Sent Mail"` / `"[Gmail]/Drafts"`. If `imap.secret_key` is omitted, the SMTP password is reused (iCloud uses the same app-specific password for both). Sent-copy APPEND failures are **non-fatal** because the message was already delivered. Draft APPEND failures are fatal because no reviewable draft was created. Non-iCloud draft creation requires an explicit `imap.host` and matching source-account username. A profile override replaces the whole `imap` block rather than merging field-by-field, so a profile that sets `imap.host` must also restate `sent_folder` and `drafts_folder` — otherwise both fall back to the iCloud-shaped defaults.
 
 **Secrets management:**
 

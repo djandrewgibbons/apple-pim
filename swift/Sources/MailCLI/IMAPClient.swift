@@ -28,8 +28,11 @@ public enum IMAPClientError: Error, CustomStringConvertible {
 /// Gmail `"[Gmail]/Sent Mail"`, generic IMAP `"Sent"`. The caller supplies the
 /// resolved folder via `sentFolder`.
 ///
-/// APPEND failures are NOT fatal to the overall send — the message was already
-/// delivered by SMTP. Callers surface APPEND errors as a non-fatal warning.
+/// `appendToSent` failures are NOT fatal to the overall send — the message was
+/// already delivered by SMTP, so callers surface those as a non-fatal warning.
+/// `appendToDrafts` failures ARE fatal: the APPEND is the only thing that
+/// persists the draft, so a caller that swallowed it would report success for a
+/// draft that does not exist.
 public struct IMAPClient: Sendable {
 
     public struct Credentials: Sendable {
