@@ -437,6 +437,15 @@ describe("Category 1: Tool Call Correctness", () => {
       expect(argsPairPresent(callArgs, "--attachment", attachA)).toBe(true);
     });
 
+    it("reply passes --draft for a reviewable draft", async () => {
+      const mockCLI = createMockCLI({ "mail-cli:reply": { success: true, draft: true } });
+      await handleMail({
+        action: "reply", id: "msg_1", body: "thanks", draft: true,
+      }, mockCLI);
+
+      expect(mockCLI.mock.calls[0][1]).toContain("--draft");
+    });
+
     it("reply passes multiple --attachment flags for array", async () => {
       const mockCLI = createMockCLI({ "mail-cli:reply": { success: true } });
       await handleMail({

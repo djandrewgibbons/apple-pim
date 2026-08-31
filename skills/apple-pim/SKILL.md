@@ -259,7 +259,7 @@ Reminders hides it.
 4. **Message IDs are RFC 2822** — stable across mailbox moves
 5. **Use mailbox/account hints** when available for faster lookups
 6. **Send** (`mail` with action `send`) uses AppleScript — supports `to`, `cc`, `bcc`, `from` (account selection), `subject`, `body`
-7. **Reply** (`mail` with action `reply`) preserves threading — looks up message by RFC 2822 ID, then uses Mail.app's `reply` verb
+7. **Reply** (`mail` with action `reply`) preserves threading — normally sends through Mail.app's `reply` verb; set `draft: true` to save a formatted, threaded reply-all to the source account's Drafts mailbox for human review instead
 8. **Auth check** (`mail` with action `auth_check`) verifies DKIM/SPF against `~/.config/apple-pim/trusted-senders.json` — returns `verified`, `suspicious`, `untrusted`, or `unknown`, plus `evaluated`. A missing config file no longer stops the check: authentication is still evaluated, nobody is enrolled, and the result says so. A config file that exists but will not parse is a hard error
 9. **Read `evaluated` before trusting a verdict** — `unknown` with `evaluated: false` means the DKIM/SPF checks never ran (no headers, no trusted `authserv-id`), which is a different situation from running them and being unsure. Treating the first as the second means acting on a check that did not happen
 10. **Use `senderAddress` for decisions, `sender` for display** — `sender` joins the display name and the address into one string, and the display name is chosen by the sender. `messages`, `search`, and `get` all return `senderAddress`/`senderName` separately (`get` adds `replyToAddress`/`replyToName`); route, filter, and match on the address

@@ -2046,6 +2046,9 @@ struct ReplyMessage: AsyncParsableCommand {
     @Option(name: .long, help: "File path to attach (repeatable)")
     var attachment: [String] = []
 
+    @Flag(name: .long, help: "Save a formatted reply-all to Drafts for human review instead of sending")
+    var draft: Bool = false
+
     func run() async throws {
         try ensureMailRunning(launch: true)
         let config = pimOptions.loadConfig()
@@ -2070,11 +2073,24 @@ struct ReplyMessage: AsyncParsableCommand {
         if (!msg) {
             JSON.stringify({error: "Message not found: \(escapeForJXA(id))"});
         } else {
+            const accountEmails = [];
+            const toRecipients = [];
+            const ccRecipients = [];
+            try { (msg.mailbox().account().emailAddresses() || []).forEach(e => { if (e) accountEmails.push(e); }); } catch (e) {}
+            try { msg.toRecipients().forEach(r => { const a = r.address(); if (a) toRecipients.push(a); }); } catch (e) {}
+            try { msg.ccRecipients().forEach(r => { const a = r.address(); if (a) ccRecipients.push(a); }); } catch (e) {}
             JSON.stringify({
                 appleMailId: msg.id(),
                 account: msg.mailbox().account().name(),
                 mailbox: msg.mailbox().name(),
-                subject: msg.subject()
+                subject: msg.subject(),
+                sender: msg.sender(),
+                replyTo: msg.replyTo(),
+                accountEmails: accountEmails,
+                toRecipients: toRecipients,
+                ccRecipients: ccRecipients,
+                content: \(draft ? "msg.content()," : "null,"),
+                source: \(draft ? "msg.source()" : "null")
             });
         }
         """
@@ -2095,6 +2111,76 @@ struct ReplyMessage: AsyncParsableCommand {
             throw CLIError.jxaError("Could not extract message details for reply")
         }
         _ = mailboxName  // retained for diagnostics; no longer used to address the message
+
+        if draft {
+            let enriched = withParsedAddresses(dict)
+            let senderAddress = enriched["senderAddress"] as? String ?? ""
+            let replyToAddress = enriched["replyToAddress"] as? String
+            let accountAddresses = dict["accountEmails"] as? [String] ?? []
+            let originalTo = dict["toRecipients"] as? [String] ?? []
+            let originalCc = dict["ccRecipients"] as? [String] ?? []
+            let envelope = try buildReplyDraftEnvelope(
+                replyToAddress: replyToAddress,
+                senderAddress: senderAddress,
+                originalTo: originalTo,
+                originalCc: originalCc,
+                accountAddresses: accountAddresses,
+                configuredUsername: config.imap?.username ?? config.smtp?.username
+            )
+
+            let source = dict["source"] as? String ?? ""
+            let parsed = parseRFC822(data: Data(source.utf8))
+            let originalPlain = (dict["content"] as? String) ?? parsed.content
+            let attribution = (dict["sender"] as? String) ?? senderAddress
+            let parentID = MIMEMessage.bracketed(id) ?? id
+            var references = messageIDs(in: parsed.header("References"))
+            if !references.contains(parentID) { references.append(parentID) }
+
+            let mimeAttachments = try attachment.map { path -> Attachment in
+                let expanded = (path as NSString).expandingTildeInPath
+                let data = try Data(contentsOf: URL(fileURLWithPath: expanded))
+                let filename = (expanded as NSString).lastPathComponent
+                return Attachment(filename: filename, contentType: SMTPSend.guessContentType(for: filename), data: data)
+            }
+            let message = MIMEMessage(
+                from: envelope.from,
+                to: envelope.to,
+                cc: envelope.cc,
+                subject: replySubject((dict["subject"] as? String) ?? ""),
+                html: buildReplyHTML(
+                    myText: body,
+                    attributionSender: attribution,
+                    originalHTML: parsed.htmlContent,
+                    originalPlain: originalPlain
+                ),
+                attachments: mimeAttachments,
+                inReplyTo: parentID,
+                references: references
+            )
+            let rendered = try message.render()
+            let resolved = try resolveIMAPDraftAccount(config: config, accountAddresses: accountAddresses)
+            let imap = IMAPClient(
+                host: resolved.host,
+                port: resolved.port,
+                credentials: .init(username: resolved.username, password: resolved.password),
+                sentFolder: resolved.folder
+            )
+            try await imap.appendToDrafts(rendered, internalDate: Date(), folder: resolved.folder)
+            var result: [String: Any] = [
+                "success": true,
+                "message": "Reply-all draft saved to \(resolved.folder) for review",
+                "draft": true,
+                "inReplyTo": id,
+                "from": envelope.from,
+                "to": envelope.to,
+                "cc": envelope.cc,
+            ]
+            if !attachment.isEmpty {
+                result["attachments"] = attachment.map { ($0 as NSString).expandingTildeInPath }
+            }
+            outputJSON(result)
+            return
+        }
 
         // Step 2: Write body to temp file
         let bodyFile = FileManager.default.temporaryDirectory.appendingPathComponent("mail-reply-\(UUID().uuidString).txt")
