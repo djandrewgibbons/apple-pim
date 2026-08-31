@@ -5,9 +5,44 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # macOS runner minutes bill at 10x the Linux rate, so the two macOS jobs
+  # below only run on pull requests (the merge commit re-running them on push
+  # to main added nothing) and only when their source paths actually changed.
+  # Job-level skips via dorny/paths-filter still satisfy the required checks
+  # ("MCP Server (Node)", "Swift CLI") — a workflow-level paths filter would
+  # leave them stuck as Expected.
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      node: ${{ steps.filter.outputs.node }}
+      swift: ${{ steps.filter.outputs.swift }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            node:
+              - 'lib/**'
+              - 'mcp-server/**'
+              - 'package.json'
+              - '.github/workflows/tests.yml'
+            swift:
+              - 'swift/**'
+              - '.github/workflows/tests.yml'
+
   mcp-server-tests:
     name: MCP Server (Node)
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.node == 'true'
     runs-on: macos-latest
     defaults:
       run:
@@ -60,6 +95,8 @@ jobs:
 
   swift-cli-tests:
     name: Swift CLI
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.swift == 'true'
     runs-on: macos-latest
     defaults:
       run:
