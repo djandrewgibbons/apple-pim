@@ -2046,6 +2046,9 @@ struct ReplyMessage: AsyncParsableCommand {
     @Option(name: .long, help: "File path to attach (repeatable)")
     var attachment: [String] = []
 
+    @Flag(name: .long, help: "Save a formatted reply-all to Drafts for human review instead of sending")
+    var draft: Bool = false
+
     func run() async throws {
         try ensureMailRunning(launch: true)
         let config = pimOptions.loadConfig()
@@ -2063,6 +2066,11 @@ struct ReplyMessage: AsyncParsableCommand {
 
         // Step 1: Use JXA to find the message by RFC 2822 messageId and get its numeric Apple Mail ID
         let findHelper = findMessageJXA(targetId: id, mailbox: mailbox, account: account)
+        // The body/source fetch is expensive and only the draft path quotes the original.
+        let draftFetch = draft ? """
+            try { originalContent = msg.content(); } catch (e) { lookupErrors.push("content: " + e); }
+            try { originalSource = msg.source(); } catch (e) { lookupErrors.push("source: " + e); }
+        """ : ""
         let lookupScript = """
         \(findHelper)
 
@@ -2070,11 +2078,29 @@ struct ReplyMessage: AsyncParsableCommand {
         if (!msg) {
             JSON.stringify({error: "Message not found: \(escapeForJXA(id))"});
         } else {
+            const accountEmails = [];
+            const toRecipients = [];
+            const ccRecipients = [];
+            const lookupErrors = [];
+            let originalContent = null;
+            let originalSource = null;
+            try { (msg.mailbox().account().emailAddresses() || []).forEach(e => { if (e) accountEmails.push(e); }); } catch (e) { lookupErrors.push("accountEmails: " + e); }
+            try { msg.toRecipients().forEach(r => { const a = r.address(); if (a) toRecipients.push(a); }); } catch (e) { lookupErrors.push("toRecipients: " + e); }
+            try { msg.ccRecipients().forEach(r => { const a = r.address(); if (a) ccRecipients.push(a); }); } catch (e) { lookupErrors.push("ccRecipients: " + e); }
+        \(draftFetch)
             JSON.stringify({
                 appleMailId: msg.id(),
                 account: msg.mailbox().account().name(),
                 mailbox: msg.mailbox().name(),
-                subject: msg.subject()
+                subject: msg.subject(),
+                sender: msg.sender(),
+                replyTo: msg.replyTo(),
+                accountEmails: accountEmails,
+                toRecipients: toRecipients,
+                ccRecipients: ccRecipients,
+                lookupErrors: lookupErrors,
+                content: originalContent,
+                source: originalSource
             });
         }
         """
@@ -2095,6 +2121,82 @@ struct ReplyMessage: AsyncParsableCommand {
             throw CLIError.jxaError("Could not extract message details for reply")
         }
         _ = mailboxName  // retained for diagnostics; no longer used to address the message
+
+        if draft {
+            if let lookupErrors = dict["lookupErrors"] as? [String], !lookupErrors.isEmpty {
+                throw CLIError.jxaError("Mail lookup failed for draft reply: \(lookupErrors.joined(separator: "; "))")
+            }
+            let enriched = withParsedAddresses(dict)
+            let senderAddress = enriched["senderAddress"] as? String ?? ""
+            let replyToAddress = enriched["replyToAddress"] as? String
+            let accountAddresses = dict["accountEmails"] as? [String] ?? []
+            let originalTo = dict["toRecipients"] as? [String] ?? []
+            let originalCc = dict["ccRecipients"] as? [String] ?? []
+            let envelope = try buildReplyDraftEnvelope(
+                replyToAddress: replyToAddress,
+                senderAddress: senderAddress,
+                originalTo: originalTo,
+                originalCc: originalCc,
+                accountAddresses: accountAddresses,
+                configuredUsername: config.imap?.username ?? config.smtp?.username
+            )
+
+            guard let source = dict["source"] as? String, !source.isEmpty else {
+                throw CLIError.jxaError("could not read the original message source for the draft")
+            }
+            let parsed = parseRFC822(data: Data(source.utf8))
+            let jxaContent = (dict["content"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let originalPlain = jxaContent ?? parsed.content
+            let attribution = (dict["sender"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? senderAddress
+            let parentID = MIMEMessage.bracketed(id) ?? id
+            var references = messageIDs(in: parsed.header("References"))
+            if !references.contains(parentID) { references.append(parentID) }
+
+            let mimeAttachments = try attachment.map { path -> Attachment in
+                let expanded = (path as NSString).expandingTildeInPath
+                let data = try Data(contentsOf: URL(fileURLWithPath: expanded))
+                let filename = (expanded as NSString).lastPathComponent
+                return Attachment(filename: filename, contentType: SMTPSend.guessContentType(for: filename), data: data)
+            }
+            let message = MIMEMessage(
+                from: envelope.from,
+                to: envelope.to,
+                cc: envelope.cc,
+                subject: replySubject((dict["subject"] as? String) ?? ""),
+                html: buildReplyHTML(
+                    myText: body,
+                    attributionSender: attribution,
+                    originalHTML: parsed.htmlContent,
+                    originalPlain: originalPlain
+                ),
+                attachments: mimeAttachments,
+                inReplyTo: parentID,
+                references: references
+            )
+            let rendered = try message.render()
+            let resolved = try resolveIMAPDraftAccount(config: config, accountAddresses: accountAddresses)
+            let imap = IMAPClient(
+                host: resolved.host,
+                port: resolved.port,
+                credentials: .init(username: resolved.username, password: resolved.password),
+                sentFolder: resolved.folder
+            )
+            try await imap.appendToDrafts(rendered, internalDate: Date(), folder: resolved.folder)
+            var result: [String: Any] = [
+                "success": true,
+                "message": "Reply-all draft saved to \(resolved.folder) for review",
+                "draft": true,
+                "inReplyTo": id,
+                "from": envelope.from,
+                "to": envelope.to,
+                "cc": envelope.cc,
+            ]
+            if !attachment.isEmpty {
+                result["attachments"] = attachment.map { ($0 as NSString).expandingTildeInPath }
+            }
+            outputJSON(result)
+            return
+        }
 
         // Step 2: Write body to temp file
         let bodyFile = FileManager.default.temporaryDirectory.appendingPathComponent("mail-reply-\(UUID().uuidString).txt")

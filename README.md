@@ -413,6 +413,7 @@ mail-cli messages --mailbox INBOX --limit 10
 mail-cli send --to "user@example.com" --subject "Hello" --body "Message"
 mail-cli send --to "user@example.com" --subject "Report" --body "See attached" --attachment ~/report.pdf
 mail-cli reply --id "<message-id>" --body "Thanks!"
+mail-cli reply --id "<message-id>" --body "Thanks!" --draft  # threaded reply-all for review
 mail-cli save-attachment --id "<message-id>" --dest-dir ~/Downloads
 mail-cli auth-check --id "<message-id>"
 
@@ -531,7 +532,7 @@ mail-cli smtp-send --verbose --to you@example.com --from me@icloud.com \
 | `--tls-insecure-skip-verify` | Skip TLS cert verification (STARTTLS only; for self-signed test servers). |
 | `--imap-append-sent` / `--no-imap-append-sent` | APPEND the sent message to the IMAP Sent folder so it appears in Mail.app/iCloud. Defaults **on** for iCloud SMTP (`*.mail.me.com`), **off** otherwise. Configure non-iCloud servers via the `imap` config block. |
 
-**IMAP Sent-folder config** (`~/.config/apple-pim/config.json`) — only needed for non-iCloud, or to override defaults:
+**IMAP Sent/Drafts-folder config** (`~/.config/apple-pim/config.json`) — used for SMTP Sent copies and `reply --draft`; only needed for non-iCloud, or to override defaults:
 
 ```json
 {
@@ -539,6 +540,7 @@ mail-cli smtp-send --verbose --to you@example.com --from me@icloud.com \
     "host": "imap.mail.me.com",
     "port": 993,
     "sent_folder": "Sent Messages",
+    "drafts_folder": "Drafts",
     "username": "me@icloud.com",
     "secret_key": "imap.icloud.password",
     "append_sent": true
@@ -546,7 +548,7 @@ mail-cli smtp-send --verbose --to you@example.com --from me@icloud.com \
 }
 ```
 
-Folder names differ by provider: iCloud `"Sent Messages"`, Gmail `"[Gmail]/Sent Mail"`, generic `"Sent"`. If `imap.secret_key` is omitted, the SMTP password is reused (iCloud uses the same app-specific password for both). APPEND failures are **non-fatal** — the message was already delivered by SMTP, so the failure surfaces as a warning plus an `"imap_append": {"success": false, ...}` field in the JSON result.
+Folder names differ by provider: iCloud uses `"Sent Messages"` / `"Drafts"`; Gmail uses `"[Gmail]/Sent Mail"` / `"[Gmail]/Drafts"`. If `imap.secret_key` is omitted, the SMTP password is reused (iCloud uses the same app-specific password for both). Sent-copy APPEND failures are **non-fatal** because the message was already delivered. Draft APPEND failures are fatal because no reviewable draft was created. Non-iCloud draft creation requires an explicit `imap.host` and matching source-account username. A profile override replaces the whole `imap` block rather than merging field-by-field, so a profile that sets `imap.host` must also restate `sent_folder` and `drafts_folder` — otherwise both fall back to the iCloud-shaped defaults.
 
 **Secrets management:**
 
