@@ -11,6 +11,7 @@ public struct PIMProfileOverride: Codable, Equatable, Sendable {
     public var defaultCalendar: String?
     public var defaultReminderList: String?
     public var smtp: SMTPDefaults?
+    public var imap: IMAPDefaults?
 
     public init(
         calendars: DomainFilterConfig? = nil,
@@ -19,7 +20,8 @@ public struct PIMProfileOverride: Codable, Equatable, Sendable {
         mail: DomainConfig? = nil,
         defaultCalendar: String? = nil,
         defaultReminderList: String? = nil,
-        smtp: SMTPDefaults? = nil
+        smtp: SMTPDefaults? = nil,
+        imap: IMAPDefaults? = nil
     ) {
         self.calendars = calendars
         self.reminders = reminders
@@ -28,10 +30,11 @@ public struct PIMProfileOverride: Codable, Equatable, Sendable {
         self.defaultCalendar = defaultCalendar
         self.defaultReminderList = defaultReminderList
         self.smtp = smtp
+        self.imap = imap
     }
 
     enum CodingKeys: String, CodingKey {
-        case calendars, reminders, contacts, mail, smtp
+        case calendars, reminders, contacts, mail, smtp, imap
         case defaultCalendar = "default_calendar"
         case defaultReminderList = "default_reminder_list"
     }

@@ -124,6 +124,7 @@ public struct ConfigLoader {
         if let defaultCalendar = profile.defaultCalendar { merged.defaultCalendar = defaultCalendar }
         if let defaultReminderList = profile.defaultReminderList { merged.defaultReminderList = defaultReminderList }
         if let smtp = profile.smtp { merged.smtp = smtp }
+        if let imap = profile.imap { merged.imap = imap }
         return merged
     }
 

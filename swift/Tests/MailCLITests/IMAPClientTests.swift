@@ -50,6 +50,31 @@ struct IMAPClientTests {
         try fake.verifyComplete()
     }
 
+    @Test("Draft APPEND uses the requested folder and Draft flag")
+    func testDraftAppend() async throws {
+        let raw = Self.rawMessage
+        let rawString = String(data: raw, encoding: .utf8)!
+        let fake = FakeTransport([
+            .reply(lines: ["* OK ready"]),
+            .expectSend({ $0.hasPrefix("A1 LOGIN ") }, label: "LOGIN"),
+            .reply(lines: ["A1 OK done"]),
+            .expectSend({ $0.hasPrefix("A2 APPEND \"[Gmail]/Drafts\" (\\Draft) ") }, label: "draft APPEND"),
+            .reply(lines: ["+ go"]),
+            .expectSend({ $0 == rawString + "\r\n" }, label: "literal"),
+            .reply(lines: ["A2 OK appended"]),
+            .expectSend({ $0 == "A3 LOGOUT\r\n" }, label: "LOGOUT"),
+            .reply(lines: ["A3 OK"]),
+        ])
+        try await client().runAppend(
+            transport: fake,
+            rawMessage: raw,
+            internalDate: Self.fixedDate,
+            folder: "[Gmail]/Drafts",
+            flags: "(\\Draft)"
+        )
+        try fake.verifyComplete()
+    }
+
     @Test("APPEND skips untagged status lines before the tagged OK")
     func testSkipsUntaggedBeforeTagged() async throws {
         let raw = Self.rawMessage
