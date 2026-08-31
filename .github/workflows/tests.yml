@@ -111,20 +111,18 @@ jobs:
       - name: Run Swift tests
         run: swift test
 
-  # openclaw/ defines `"test": "node --test \"src/**/*.test.ts\""` and, until now, nothing
-  # ran it. Those suites cover the mail channel's ingress admission -- allowlist matching,
-  # per-message authentication strength, the loop guard, thread permission, and the
-  # scenario table that exists to catch drift between the documented rows and the code.
-  # #121 rewrote all three of them under six green checks that never executed one.
+  # openclaw/ defines `"test": "node --test \"src/**/*.test.ts\""`. Those suites cover
+  # the mail channel's ingress admission -- allowlist matching, per-message
+  # authentication strength, the loop guard, thread permission, and the scenario
+  # table that exists to catch drift between the documented rows and the code.
   #
-  # It cannot run for real yet: openclaw/package.json pins a floor no published release
-  # satisfies, so `npm install` here fails with ETARGET. Rather than land a red job or
-  # wait and forget, the job lands now and turns itself on the moment an installable SDK
-  # ships the contract. While it cannot run it says so in the step summary and in a
-  # notice, because a job that goes quietly green is the failure mode this repo keeps
-  # finding (see the v3.14.0 publish "Verify" step, and this suite's own absence).
+  # The job self-enabled on 2026-08-31 when openclaw@2026.8.1 hit npm -- the first
+  # published release that both satisfies the plugin's declared floor and ships the
+  # channel-ingress contract. The probe stays: it asserts the capability, not the
+  # version, so if a future published SDK regresses the contract this job goes back
+  # to skipping loudly instead of failing for the wrong reason.
   #
-  # Do NOT make this a required check until the summary stops saying "skipped".
+  # Eligible for required-check promotion once its summary has said "RAN" for a while.
   openclaw-plugin-tests:
     name: OpenClaw Plugin
     runs-on: ubuntu-latest
@@ -164,7 +162,12 @@ jobs:
       - name: Install plugin dependencies
         if: steps.sdk.outputs.available == 'true'
         working-directory: openclaw
-        run: npm install
+        # apple-pim-cli declares "os": ["darwin"] (at runtime it spawns the four
+        # macOS-only Swift CLIs), so a plain `npm install` refuses to run here with
+        # EBADPLATFORM. The test suite itself is pure logic and passes on linux
+        # (verified: node:24, 251/251); --force downgrades the platform check to a
+        # warning, which keeps this job off 10x-priced macOS runners.
+        run: npm install --force
 
       - name: Run OpenClaw plugin tests
         if: steps.sdk.outputs.available == 'true'
