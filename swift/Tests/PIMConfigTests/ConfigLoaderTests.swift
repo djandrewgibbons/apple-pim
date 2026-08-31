@@ -63,7 +63,7 @@ struct ConfigLoaderTests {
             imap: IMAPDefaults(
                 host: "imap.mail.me.com", port: 993,
                 username: "me@icloud.com", secretKey: "imap.icloud.password",
-                sentFolder: "Sent Messages", appendSent: true
+                sentFolder: "Sent Messages", draftsFolder: "Drafts", appendSent: true
             )
         )
 
@@ -79,6 +79,7 @@ struct ConfigLoaderTests {
         #expect(smtp["secret_key"] as? String == "smtp.example.password")
         let imap = json["imap"] as! [String: Any]
         #expect(imap["sent_folder"] as? String == "Sent Messages")
+        #expect(imap["drafts_folder"] as? String == "Drafts")
         #expect(imap["append_sent"] as? Bool == true)
         #expect(imap["secret_key"] as? String == "imap.icloud.password")
     }
@@ -125,6 +126,18 @@ struct ConfigLoaderTests {
         // Reminders inherited from base (not in profile)
         #expect(merged.reminders.items == ["X", "Y"])
         #expect(merged.defaultReminderList == "X")
+    }
+
+    @Test("Profile IMAP settings replace the base account")
+    func testProfileIMAPOverride() {
+        let base = PIMConfiguration(imap: IMAPDefaults(username: "base@example.com", draftsFolder: "Drafts"))
+        let profile = PIMProfileOverride(imap: IMAPDefaults(
+            host: "imap.example.net",
+            username: "agent@example.net",
+            draftsFolder: "Agent Drafts"
+        ))
+        let merged = ConfigLoader.merge(base: base, profile: profile)
+        #expect(merged.imap == profile.imap)
     }
 
     @Test("Nil profile returns base unchanged")
