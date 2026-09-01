@@ -87,7 +87,8 @@ Each Swift CLI is a standalone binary that reads from macOS frameworks, validate
 - Required checks on `main`:
   - `MCP Server (Node)`
   - `Swift CLI`
-  - `Agent Evals`
+  - `Version Consistency`
+  - `OpenClaw Plugin` (promoted 2026-09-01 after its first real runs against openclaw@2026.8.1)
 - Auto-merge is enabled at the repo level; use it on PRs so merges wait for required checks.
 - This repo ignores lockfiles; CI uses `npm install` (not `npm ci`) in `mcp-server`.
 - Agent evals run on `ubuntu-latest` (no macOS needed since they use mock fixtures).
