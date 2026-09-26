@@ -3116,7 +3116,6 @@ var require_utils = __commonJS({
     "use strict";
     var isUUID = RegExp.prototype.test.bind(/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu);
     var isIPv4 = RegExp.prototype.test.bind(/^(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)$/u);
-    var isPort = RegExp.prototype.test.bind(/^\d*$/u);
     var isHexPair = RegExp.prototype.test.bind(/^[\da-f]{2}$/iu);
     var isUnreserved = RegExp.prototype.test.bind(/^[\da-z\-._~]$/iu);
     var isPathCharacter = RegExp.prototype.test.bind(/^[A-Za-z0-9\-._~!$&'()*+,;=:@/]$/u);
@@ -3582,12 +3581,8 @@ var require_utils = __commonJS({
         uriTokens.push(host);
       }
       if (typeof component.port === "number" || typeof component.port === "string") {
-        const port = String(component.port);
-        if (!isPort(port)) {
-          throw new TypeError("URI port is malformed.");
-        }
         uriTokens.push(":");
-        uriTokens.push(port);
+        uriTokens.push(String(component.port));
       }
       return uriTokens.length ? uriTokens.join("") : void 0;
     }
@@ -4030,15 +4025,12 @@ var require_fast_uri = __commonJS({
       }
       return false;
     }
-    function isIPLiteral(host) {
-      return host[0] === "[" && host[host.length - 1] === "]";
-    }
     function hasMalformedComponentPercentEncoding(matches) {
       const host = matches[4];
-      return hasMalformedPercentEncoding(matches[3]) || host !== void 0 && !isIPLiteral(host) && hasMalformedPercentEncoding(host) || hasMalformedPercentEncoding(matches[6]) || hasMalformedPercentEncoding(matches[7]) || hasMalformedPercentEncoding(matches[8]);
+      return hasMalformedPercentEncoding(matches[3]) || host !== void 0 && !(host[0] === "[" && host[host.length - 1] === "]") && hasMalformedPercentEncoding(host) || hasMalformedPercentEncoding(matches[6]) || hasMalformedPercentEncoding(matches[7]) || hasMalformedPercentEncoding(matches[8]);
     }
     function canonicalizeHost(parsed, options, schemeHandler, isIP) {
-      if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport) && parsed.host && !isIPLiteral(parsed.host) && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP === false && nonSimpleDomain(parsed.host)) {
+      if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport) && parsed.host && parsed.host[0] !== "[" && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP === false && nonSimpleDomain(parsed.host)) {
         try {
           parsed.host = new URL("http://" + parsed.host).hostname;
         } catch (e) {
@@ -4125,11 +4117,10 @@ var require_fast_uri = __commonJS({
         if (parsed.host) {
           const ipv4result = isIPv4(parsed.host);
           if (ipv4result === false) {
-            const bracketedIPLiteral = isIPLiteral(parsed.host);
-            const hasIPLiteralBracket = parsed.host.indexOf("[") !== -1 || parsed.host.indexOf("]") !== -1;
+            const bracketedIPLiteral = parsed.host[0] === "[" && parsed.host[parsed.host.length - 1] === "]";
             const ipv6result = normalizeIPv6(parsed.host);
             isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true;
-            malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true);
+            malformedIPLiteral = bracketedIPLiteral && ipv6result.error === true;
             parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase();
             if (malformedIPLiteral) {
               parsed.error = parsed.error || "URI host is malformed.";
@@ -74262,7 +74253,7 @@ var tools = [
   },
   {
     name: "mail",
-    description: "Manage Mail.app messages. Requires Mail.app to be running. Actions: accounts, mailboxes, messages (list with attachmentCount), get (full message by ID with attachment metadata), search, update (flags), move, delete, batch_update, batch_delete, send (with optional attachments), reply (with optional attachments), save_attachment (save message attachments to disk), auth_check, schema (show input schema). messages/search/get return senderAddress and senderName (and replyToAddress/replyToName on get) alongside the joined sender string \u2014 use senderAddress for any routing, filtering, or trust decision, since a display name is sender-chosen and may itself look like an address. auth_check returns evaluated: false when the DKIM/SPF checks never ran, which is not the same as running them and being unsure.",
+    description: "Manage Mail.app messages. Requires Mail.app to be running. Actions: accounts, mailboxes, messages (list with attachmentCount), get (full message by ID with attachment metadata), search, update (flags), move, delete, batch_update, batch_delete, send (with optional attachments), reply (with optional attachments), save_attachment (save message attachments to disk), auth_check, schema (show input schema). messages/search/get return senderAddress and senderName (and replyToAddress/replyToName on get) alongside the joined sender string \u2014 use senderAddress for any routing, filtering, or trust decision, since a display name is sender-chosen and may itself look like an address. Set draft:true on reply to save a formatted, threaded reply-all draft for human review instead of sending it. auth_check returns evaluated: false when the DKIM/SPF checks never ran, which is not the same as running them and being unsure.",
     inputSchema: {
       type: "object",
       properties: {
@@ -74325,6 +74316,7 @@ var tools = [
         bcc: { type: "array", items: { type: "string" }, description: "BCC addresses (send)" },
         from: { type: "string", description: "Sender email address for account selection (send)" },
         attachment: { type: "array", items: { type: "string" }, description: 'File paths to attach (send/reply). DISABLED BY DEFAULT to prevent local-file exfiltration. Opt in by creating ~/.config/apple-pim/mail-attachments.json with {"enabled": true, "allowedRoots": ["~/Downloads"]}. Even when enabled, paths in ~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, ~/.docker, ~/.secrets, etc. and files matching id_rsa/.netrc/.pgpass/*.pem/*.key/*secret*/*credential* are always refused. Symlinks are resolved to canonical paths before checking.' },
+        draft: { type: "boolean", description: "For reply only: save a formatted, threaded reply-all draft to the source account's Drafts mailbox for human review instead of sending." },
         index: { type: "integer", minimum: 0, description: "Zero-based attachment index (save_attachment). Omit to save all attachments." },
         destDir: { type: "string", description: "Directory to save attachments into (save_attachment). Must be within home directory or system temp; sensitive subpaths (~/.ssh, ~/.aws, ~/.gnupg, ~/Library/LaunchAgents, ~/.config/apple-pim, etc.) are always refused even inside home. Defaults to system temp. Use dryRun: true to preview." },
         trustedSenders: { type: "string", description: "Path to trusted-senders.json (auth_check)" },
@@ -75348,6 +75340,7 @@ async function handleMail(args, runCLI2) {
         const safe = validateAttachments(args.attachment);
         for (const p of safe) replyArgs.push("--attachment", p);
       }
+      if (args.draft) replyArgs.push("--draft");
       return await runCLI2("mail-cli", replyArgs);
     }
     case "save_attachment": {
