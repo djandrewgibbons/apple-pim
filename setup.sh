@@ -8,6 +8,10 @@
 #   ./setup.sh --install --link    # Dev mode: symlink into ~/.local/bin instead
 #   ./setup.sh --install --build   # Force a local build (skip signed release binaries)
 #
+# A local --install signs the copied CLIs and the helper app with
+# APPLE_PIM_SIGN_IDENTITY, defaulting to APPLE_PIM_SIGNING_CERT from
+# scripts/lib/signing-identities.sh.
+#
 # Why copies are the default: a symlinked install points into this checkout,
 # so renaming, moving, or cleaning the repo silently bricks every consumer
 # (the MCP server, the OpenClaw plugin, Apple PIM Helper.app). Copies survive all
@@ -17,6 +21,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/signing-identities.sh
+. "$SCRIPT_DIR/scripts/lib/signing-identities.sh"
+export APPLE_PIM_SIGN_IDENTITY="${APPLE_PIM_SIGN_IDENTITY:-$APPLE_PIM_SIGNING_CERT}"
 INSTALL_DIR="${HOME}/.local/bin"
 CLIS=(calendar-cli reminder-cli contacts-cli mail-cli)
 
@@ -107,6 +114,13 @@ elif [ "$INSTALL" = true ]; then
             echo "  Copying $cli"
             cp -f "$src" "$dest"
             chmod +x "$dest"
+            # Same identifier and flags as the release workflow: TCC grants and
+            # keychain access lists pin identifier + team, so they survive every
+            # later rebuild. A missing certificate fails the install.
+            echo "  Signing $cli as $APPLE_PIM_SIGN_IDENTITY"
+            codesign --force --timestamp --options runtime \
+                -i "$(pim_signing_identifier "$cli")" \
+                --sign "$APPLE_PIM_SIGN_IDENTITY" "$dest"
         fi
     done
     echo ""

@@ -23,6 +23,7 @@ struct SecretsStoreTests {
             self.openclawPath = tmp.appendingPathComponent("openclaw/secrets.json")
             setenv("APPLE_PIM_CONFIG_DIR", configDir.path, 1)
             setenv("OPENCLAW_SECRETS_PATH", openclawPath.path, 1)
+            setenv("APPLE_PIM_KEYCHAIN_SERVICE", "apple-pim-test-\(UUID().uuidString)", 1)
             try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
             try? FileManager.default.createDirectory(
                 at: openclawPath.deletingLastPathComponent(),
@@ -31,6 +32,7 @@ struct SecretsStoreTests {
         }
 
         func tearDown() {
+            unsetenv("APPLE_PIM_KEYCHAIN_SERVICE")
             unsetenv("APPLE_PIM_CONFIG_DIR")
             unsetenv("OPENCLAW_SECRETS_PATH")
             try? FileManager.default.removeItem(at: root)
@@ -88,7 +90,7 @@ struct SecretsStoreTests {
         try h.writeStandaloneJSON(#"{"smtp":{"icloud":{"password":"from-standalone"}}}"#)
         setenv("SMTP_ICLOUD_PASSWORD", "from-env", 1)
         defer { unsetenv("SMTP_ICLOUD_PASSWORD") }
-        #expect(SecretsStore.resolve("smtp.icloud.password") == "from-env")
+        #expect(try SecretsStore.resolve("smtp.icloud.password") == "from-env")
     }
 
     @Test("OpenClaw wins over standalone")
@@ -96,7 +98,7 @@ struct SecretsStoreTests {
         let h = Harness(); defer { h.tearDown() }
         try h.writeOpenclawJSON(#"{"smtp":{"icloud":{"password":"from-openclaw"}}}"#)
         try h.writeStandaloneJSON(#"{"smtp":{"icloud":{"password":"from-standalone"}}}"#)
-        #expect(SecretsStore.resolve("smtp.icloud.password") == "from-openclaw")
+        #expect(try SecretsStore.resolve("smtp.icloud.password") == "from-openclaw")
     }
 
     @Test("Standalone used when openclaw lacks the key")
@@ -104,13 +106,37 @@ struct SecretsStoreTests {
         let h = Harness(); defer { h.tearDown() }
         try h.writeOpenclawJSON(#"{"other":"value"}"#)
         try h.writeStandaloneJSON(#"{"smtp":{"icloud":{"password":"from-standalone"}}}"#)
-        #expect(SecretsStore.resolve("smtp.icloud.password") == "from-standalone")
+        #expect(try SecretsStore.resolve("smtp.icloud.password") == "from-standalone")
     }
 
     @Test("Nil when no store has the key")
     func testNilWhenMissing() throws {
         let h = Harness(); defer { h.tearDown() }
-        #expect(SecretsStore.resolve("nope.nope") == nil)
+        #expect(try SecretsStore.resolve("nope.nope") == nil)
+    }
+
+    @Test("Keychain wins over env and files")
+    func testKeychainWins() throws {
+        let h = Harness(); defer { h.tearDown() }
+        try h.writeStandaloneJSON(#"{"smtp":{"icloud":{"password":"from-standalone"}}}"#)
+        setenv("SMTP_ICLOUD_PASSWORD", "from-env", 1)
+        defer { unsetenv("SMTP_ICLOUD_PASSWORD") }
+        try KeychainSecrets.write("smtp.icloud.password", value: "from-keychain")
+        #expect(try SecretsStore.resolve("smtp.icloud.password") == "from-keychain")
+        #expect(try KeychainSecrets.delete("smtp.icloud.password"))
+    }
+
+    @Test("Keychain write, overwrite, list, delete")
+    func testKeychainRoundTrip() throws {
+        let h = Harness(); defer { h.tearDown() }
+        #expect(try KeychainSecrets.read("smtp.icloud.password") == nil)
+        try KeychainSecrets.write("smtp.icloud.password", value: "first")
+        try KeychainSecrets.write("smtp.icloud.password", value: "second")
+        #expect(try KeychainSecrets.read("smtp.icloud.password") == "second")
+        #expect(try KeychainSecrets.list() == ["smtp.icloud.password"])
+        #expect(try KeychainSecrets.delete("smtp.icloud.password"))
+        #expect(try KeychainSecrets.delete("smtp.icloud.password") == false)
+        #expect(try KeychainSecrets.list().isEmpty)
     }
 
     // MARK: - Write + read round trip

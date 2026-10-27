@@ -36,7 +36,7 @@ struct SMTPSend: AsyncParsableCommand {
         app-specific password. For servers that only expose STARTTLS on port 587
         (corporate Exchange, self-hosted Postfix, some university/ISP relays) pass
         --tls-mode starttls (port defaults to 587). The password is resolved in
-        order: environment variable → ~/.openclaw/secrets.json →
+        order: login keychain → environment variable → ~/.openclaw/secrets.json →
         ~/.config/apple-pim/secrets.json.
 
         Messages sent via this path do NOT appear in Mail.app's Sent folder.
@@ -171,7 +171,7 @@ struct SMTPSend: AsyncParsableCommand {
             return
         }
 
-        guard let password = SecretsStore.resolve(effectiveSecretKey) else {
+        guard let password = try SecretsStore.resolve(effectiveSecretKey) else {
             throw CLIError.invalidInput(
                 "no password found. Set one with: mail-cli secrets set \(effectiveSecretKey)  " +
                 "(or export \(SecretsStore.envVarName(for: effectiveSecretKey)))"
@@ -207,7 +207,7 @@ struct SMTPSend: AsyncParsableCommand {
         // up in Mail.app / iCloud.com. APPEND failures are non-fatal — the message
         // was already delivered by SMTP.
         var imapAppendResult: [String: Any]? = nil
-        if let appendCfg = resolveIMAPAppend(config: config, smtpHost: host, smtpUser: smtpUser, smtpPassword: password) {
+        if let appendCfg = try resolveIMAPAppend(config: config, smtpHost: host, smtpUser: smtpUser, smtpPassword: password) {
             // Use the wire Message-ID and original date so the Sent copy matches.
             var sentCopy = message
             sentCopy.messageID = result.messageID
@@ -294,7 +294,7 @@ struct SMTPSend: AsyncParsableCommand {
         smtpHost: String,
         smtpUser: String,
         smtpPassword: String
-    ) -> ResolvedIMAP? {
+    ) throws -> ResolvedIMAP? {
         let isICloud = smtpHost.hasSuffix(".mail.me.com")
 
         let enabled = imapAppendSent
@@ -313,7 +313,7 @@ struct SMTPSend: AsyncParsableCommand {
         let username = config.imap?.username ?? smtpUser
         // Password: dedicated imap secret key if set, else reuse the SMTP password
         // (iCloud uses the same app-specific password for SMTP and IMAP).
-        let password = config.imap?.secretKey.flatMap { SecretsStore.resolve($0) } ?? smtpPassword
+        let password = try config.imap?.secretKey.flatMap { try SecretsStore.resolve($0) } ?? smtpPassword
         let sentFolder = config.imap?.sentFolder ?? "Sent Messages"
 
         return ResolvedIMAP(
@@ -349,10 +349,11 @@ struct Secrets: ParsableCommand {
         commandName: "secrets",
         abstract: "Manage secrets used by mail-cli (SMTP passwords, API tokens).",
         discussion: """
-        Secrets are stored as JSON at either ~/.openclaw/secrets.json (shared with
-        OpenClaw) or ~/.config/apple-pim/secrets.json (standalone). Keys use dotted
-        form (e.g. smtp.icloud.password) and map to JSON pointers inside the file.
-        Files are enforced at mode 0600.
+        Secrets are stored in the login keychain by default (service "apple-pim",
+        account = key). The JSON stores remain for OpenClaw: ~/.openclaw/secrets.json
+        (shared with OpenClaw) or ~/.config/apple-pim/secrets.json (standalone),
+        where dotted keys (e.g. smtp.icloud.password) map to JSON pointers and
+        files are enforced at mode 0600.
         """,
         subcommands: [SecretsSet.self, SecretsGet.self, SecretsList.self, SecretsUnset.self]
     )
@@ -367,16 +368,18 @@ struct SecretsSet: ParsableCommand {
     @Argument(help: "Secret key in dotted form (e.g. smtp.icloud.password).")
     var key: String
 
-    @Option(name: .long, help: "Target store: openclaw | standalone | auto.")
-    var store: StoreChoice = .auto
+    @Option(name: .long, help: "Target store: keychain | openclaw | standalone | auto.")
+    var store: StoreChoice = .keychain
 
     @Option(name: .long, help: "Value (non-interactive). Prefer interactive prompt for real secrets.")
     var value: String?
 
     enum StoreChoice: String, ExpressibleByArgument {
-        case openclaw, standalone, auto
-        var asKind: SecretsStoreKind {
+        case keychain, openclaw, standalone, auto
+        /// The JSON store this choice targets; nil for the keychain.
+        var fileKind: SecretsStoreKind? {
             switch self {
+            case .keychain: return nil
             case .openclaw: return .openclaw
             case .standalone: return .standalone
             case .auto: return .auto
@@ -395,7 +398,17 @@ struct SecretsSet: ParsableCommand {
             }
             resolved = prompted
         }
-        let kind = try SecretsStore.write(key, value: resolved, to: store.asKind)
+        guard let fileKind = store.fileKind else {
+            try KeychainSecrets.write(key, value: resolved)
+            outputJSON([
+                "success": true,
+                "key": key,
+                "store": StoreChoice.keychain.rawValue,
+                "service": KeychainSecrets.service,
+            ])
+            return
+        }
+        let kind = try SecretsStore.write(key, value: resolved, to: fileKind)
         outputJSON([
             "success": true,
             "key": key,
@@ -428,7 +441,7 @@ struct SecretsSet: ParsableCommand {
 struct SecretsGet: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "get",
-        abstract: "Print a secret value. Resolves in order: env → openclaw → standalone."
+        abstract: "Print a secret value. Resolves in order: keychain → env → openclaw → standalone."
     )
 
     @Argument(help: "Secret key.")
@@ -440,11 +453,17 @@ struct SecretsGet: ParsableCommand {
     func run() throws {
         try SecretsStore.validateKey(key)
         if let store {
-            let value = try SecretsStore.read(key, from: store.asKind)
-            print(value)
+            if let fileKind = store.fileKind {
+                print(try SecretsStore.read(key, from: fileKind))
+            } else {
+                guard let value = try KeychainSecrets.read(key) else {
+                    throw CLIError.notFound("secret '\(key)' not found in the keychain")
+                }
+                print(value)
+            }
             return
         }
-        guard let value = SecretsStore.resolve(key) else {
+        guard let value = try SecretsStore.resolve(key) else {
             throw CLIError.notFound("secret '\(key)' not found")
         }
         print(value)
@@ -457,14 +476,22 @@ struct SecretsList: ParsableCommand {
         abstract: "List keys in a store (values are never printed)."
     )
 
-    @Option(name: .long, help: "Which store: openclaw | standalone. Default: standalone.")
-    var store: SecretsSet.StoreChoice = .standalone
+    @Option(name: .long, help: "Which store: keychain | openclaw | standalone. Default: keychain.")
+    var store: SecretsSet.StoreChoice = .keychain
 
     func run() throws {
-        let keys = try SecretsStore.list(from: store.asKind)
+        guard let fileKind = store.fileKind else {
+            outputJSON([
+                "store": store.rawValue,
+                "service": KeychainSecrets.service,
+                "keys": try KeychainSecrets.list(),
+            ])
+            return
+        }
+        let keys = try SecretsStore.list(from: fileKind)
         outputJSON([
             "store": store.rawValue,
-            "path": SecretsStore.path(for: store.asKind).path,
+            "path": SecretsStore.path(for: fileKind).path,
             "keys": keys,
         ])
     }
@@ -479,12 +506,17 @@ struct SecretsUnset: ParsableCommand {
     @Argument(help: "Secret key.")
     var key: String
 
-    @Option(name: .long, help: "Target store: openclaw | standalone | auto. Default: auto.")
-    var store: SecretsSet.StoreChoice = .auto
+    @Option(name: .long, help: "Target store: keychain | openclaw | standalone | auto. Default: keychain.")
+    var store: SecretsSet.StoreChoice = .keychain
 
     func run() throws {
         try SecretsStore.validateKey(key)
-        let removed = try SecretsStore.unset(key, from: store.asKind)
+        let removed: Bool
+        if let fileKind = store.fileKind {
+            removed = try SecretsStore.unset(key, from: fileKind)
+        } else {
+            removed = try KeychainSecrets.delete(key)
+        }
         outputJSON([
             "success": removed,
             "key": key,

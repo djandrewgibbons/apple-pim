@@ -45,13 +45,13 @@ expect "ad-hoc cdhash pin is flagged" \
 # Captured after signing with the real Developer ID Application certificate.
 # Note the bare (unquoted) team OU.
 expect "our Developer ID signature is accepted" \
-    'identifier "com.omarshahine.apple-pim.calendar-cli" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = N9DRSTM2U6' \
+    'identifier "com.omarshahine.apple-pim.calendar-cli" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TN5EHPSRWX' \
     "$OUR_ID" ok
 
 # Captured from /opt/homebrew/bin/bun. Same shape, but the OU is quoted --
 # both spellings occur in the wild, so both must parse.
 expect "quoted team OU parses identically" \
-    'identifier "com.omarshahine.apple-pim.calendar-cli" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[subject.OU] = "N9DRSTM2U6"' \
+    'identifier "com.omarshahine.apple-pim.calendar-cli" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[subject.OU] = "TN5EHPSRWX"' \
     "$OUR_ID" ok
 
 # Captured from /opt/homebrew/bin/discrawl: a real, valid, notarized Developer
@@ -76,7 +76,7 @@ expect "Apple Development cert is not accepted for shipping" \
 # Right team, wrong identifier: grants recorded against the expected
 # identifier would not apply, so this is a real failure rather than cosmetic.
 expect "our team under an unexpected identifier is rejected" \
-    'identifier "com.omarshahine.apple-pim.reminder-cli" and anchor apple generic and certificate leaf[subject.OU] = N9DRSTM2U6' \
+    'identifier "com.omarshahine.apple-pim.reminder-cli" and anchor apple generic and certificate leaf[subject.OU] = TN5EHPSRWX' \
     "$OUR_ID" wrong-identifier
 
 expect "empty requirement means unsigned" "" "$OUR_ID" unsigned

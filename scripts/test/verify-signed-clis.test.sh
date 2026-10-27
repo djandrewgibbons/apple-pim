@@ -29,8 +29,8 @@ cleanup() { [[ -n "${TMPROOT:-}" && -d "$TMPROOT" ]] && /bin/rm -rf "$TMPROOT"; 
 trap cleanup EXIT
 
 # Real Developer ID output, captured 2026-09-04 from a calendar-cli signed
-# with "Developer ID Application: OmarKnows LLC (N9DRSTM2U6)".
-REAL_DEVID_DR='identifier "IDENTIFIER" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = N9DRSTM2U6'
+# with "Developer ID Application: Andrew Gibbons (TN5EHPSRWX)".
+REAL_DEVID_DR='identifier "IDENTIFIER" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TN5EHPSRWX'
 
 ADHOC_SOURCE="${ADHOC_SOURCE:-$HOME/.local/bin/mail-cli}"
 FOREIGN_SOURCE="${FOREIGN_SOURCE:-/opt/homebrew/bin/bun}"
@@ -175,14 +175,14 @@ if command -v codesign >/dev/null 2>&1 && [[ -f "$ADHOC_SOURCE" ]]; then
     for c in calendar-cli reminder-cli contacts-cli mail-cli; do
         cp "$ADHOC_SOURCE" "$d/$c"
         codesign --force --sign - -i "com.omarshahine.apple-pim.$c" \
-            -r="designated => identifier \"com.omarshahine.apple-pim.$c\" and anchor apple generic and certificate leaf[subject.OU] = N9DRSTM2U6" \
+            -r="designated => identifier \"com.omarshahine.apple-pim.$c\" and anchor apple generic and certificate leaf[subject.OU] = TN5EHPSRWX" \
             "$d/$c" 2>/dev/null
     done
 
     # Precondition: the forgery must actually look convincing, or the test is
     # vacuous. It must be ad-hoc, pass --verify, and advertise our team.
     sig="$(codesign -dvvv "$d/calendar-cli" 2>&1 | grep -c '^Signature=adhoc')"
-    adv="$(codesign -d -r- "$d/calendar-cli" 2>&1 | grep -c 'N9DRSTM2U6')"
+    adv="$(codesign -d -r- "$d/calendar-cli" 2>&1 | grep -c 'TN5EHPSRWX')"
     if [[ "$sig" == "1" ]] && [[ "$adv" == "1" ]] && codesign --verify --strict "$d/calendar-cli" 2>/dev/null; then
         ok "forged fixture is convincing (ad-hoc, passes --verify, advertises our team)"
     else

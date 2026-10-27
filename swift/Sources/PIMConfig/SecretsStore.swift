@@ -38,6 +38,7 @@ public enum SecretsStoreKind: String, CaseIterable, Sendable {
 /// to the JSON pointer `/smtp/icloud/password` inside the backing JSON file.
 ///
 /// Read resolution order:
+/// 0. Login keychain (`KeychainSecrets`), the fork's default store
 /// 1. Environment variable (`smtp.icloud.password` → `SMTP_ICLOUD_PASSWORD`)
 /// 2. `~/.openclaw/secrets.json` at the matching JSON pointer
 /// 3. `~/.config/apple-pim/secrets.json` at the matching JSON pointer
@@ -78,11 +79,14 @@ public struct SecretsStore: Sendable {
 
     // MARK: - Public API
 
-    /// Resolve a secret by key using the full precedence order (env → openclaw → standalone).
-    /// Returns `nil` if not found in any store.
-    public static func resolve(_ key: String) -> String? {
+    /// Resolve a secret by key using the full precedence order (keychain → env → openclaw → standalone).
+    /// Returns `nil` if not found in any store; throws if the keychain can't be read.
+    public static func resolve(_ key: String) throws -> String? {
         do { try validateKey(key) } catch { return nil }
 
+        if let stored = try KeychainSecrets.read(key) {
+            return stored
+        }
         if let env = ProcessInfo.processInfo.environment[envVarName(for: key)], !env.isEmpty {
             return env
         }
