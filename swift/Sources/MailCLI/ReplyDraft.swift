@@ -152,7 +152,7 @@ func resolveIMAPDraftAccount(config: PIMConfiguration, accountAddresses: [String
     }
 
     let secretKey = config.imap?.secretKey ?? config.smtp?.secretKey ?? "smtp.icloud.password"
-    guard let password = SecretsStore.resolve(secretKey) else {
+    guard let password = try SecretsStore.resolve(secretKey) else {
         throw CLIError.invalidInput("no IMAP password found for key '\(secretKey)'; set it with mail-cli secrets set \(secretKey)")
     }
     return ResolvedIMAPDraft(

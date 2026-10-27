@@ -28,8 +28,8 @@
 #
 # shellcheck shell=bash
 
-APPLE_PIM_TEAM_ID="N9DRSTM2U6"
-APPLE_PIM_SIGNING_CERT="Developer ID Application: OmarKnows LLC (${APPLE_PIM_TEAM_ID})"
+APPLE_PIM_TEAM_ID="TN5EHPSRWX"
+APPLE_PIM_SIGNING_CERT="Developer ID Application: Andrew Gibbons (${APPLE_PIM_TEAM_ID})"
 APPLE_PIM_IDENTIFIER_PREFIX="com.omarshahine.apple-pim"
 APPLE_PIM_HELPER_BUNDLE_ID="${APPLE_PIM_IDENTIFIER_PREFIX}.helper"
 
