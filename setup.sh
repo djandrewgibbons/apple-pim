@@ -75,7 +75,10 @@ npm install
 echo ""
 echo "Installing MCP server dependencies..."
 cd "$SCRIPT_DIR/mcp-server"
-npm install
+# --ignore-scripts: the legacy `prepublish` hook would rebuild the committed
+# dist/server.js from whatever deps resolved today and dirty the checkout.
+# Hosts run the bundle from the plugin cache, never from here.
+npm install --ignore-scripts
 
 if [ "$INSTALL" = true ] && [ "$SIGNED_INSTALL" = true ]; then
     # fetch-signed-clis.sh already installed verified binaries into
