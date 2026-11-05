@@ -7,7 +7,7 @@ allowed-tools:
 
 # Mail Management
 
-Manage macOS Mail.app messages. Reads (`accounts`, `mailboxes`, `messages`, `get`, `search`) use a fast direct-SQLite path against Mail's local Envelope Index (milliseconds, works with Mail.app closed, needs Full Disk Access) and fall back to JXA automatically. Mutations and `content` search go through Mail.app via JXA/AppleScript, which requires Mail.app to be running.
+Manage macOS Mail.app messages. Reads (`accounts`, `mailboxes`, `messages`, `get`, `search`) use a fast direct-SQLite path against Mail's local Envelope Index (milliseconds, works with Mail.app closed, needs Full Disk Access — without it they fail with an access error; `--engine jxa` bypasses the index). JXA serves only what the index cannot: `content` search and bodies not yet downloaded. Mutations and `content` search go through Mail.app via JXA/AppleScript, which requires Mail.app to be running.
 
 ## Available Operations
 

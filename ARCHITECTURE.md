@@ -135,7 +135,7 @@ apple-pim/
 - `ReminderCLI/ReminderCLI.swift` — `import EventKit`, `import CoreLocation` for location-based reminders; adds batch complete/delete and `RepairDates`
 - `ContactsCLI/ContactsCLI.swift` — `import Contacts`, `import Security`
 - `MailCLI/` (largest module, ~7,500 LOC) — `import AppKit` driving Mail.app via JXA/AppleScript (the authoritative read/write path), plus:
-  - `EnvelopeIndex.swift` / `SQLiteEngine.swift` — direct read-only SQLite access to Mail's `~/Library/Mail/V*/MailData/Envelope Index`, a fast read path that works with Mail.app closed (needs Full Disk Access; falls back to JXA on failure). `EngineChoice` (`auto`/`sqlite`/`jxa`) controls the fallback.
+  - `EnvelopeIndex.swift` / `SQLiteEngine.swift` — direct read-only SQLite access to Mail's `~/Library/Mail/V*/MailData/Envelope Index`, a fast read path that works with Mail.app closed (needs Full Disk Access; an unreadable index is fatal unless `--engine jxa`). `EngineChoice` (`auto`/`sqlite`/`jxa`) controls when JXA serves what the index cannot.
   - `EmlxReader.swift` — minimal `.emlx` parser (headers + MIME body) for the SQLite fast path
   - `MessageLocator.swift` — resolves Message-IDs to Envelope Index row IDs to accelerate JXA write-path lookups; every candidate is re-verified by Message-ID on the JXA side, so SQLite never performs the write itself
   - `IMAPClient.swift` — minimal IMAP client (LOGIN/APPEND/LOGOUT) used to append SMTP-sent messages and saved drafts into Sent/Drafts folders
@@ -188,7 +188,7 @@ No independent PIM data store — Calendar/Reminders/Contacts data lives entirel
 
 **Purpose**: Fast read path for mail listing/search/get, bypassing a Mail.app round-trip.
 
-**Key Schemas/Models**: `~/Library/Mail/V*/MailData/Envelope Index`, read via `EnvelopeIndex.swift`/`SQLiteEngine.swift`/`EnvelopeQueries.swift`; requires Full Disk Access, falls back to JXA when unavailable.
+**Key Schemas/Models**: `~/Library/Mail/V*/MailData/Envelope Index`, read via `EnvelopeIndex.swift`/`SQLiteEngine.swift`/`EnvelopeQueries.swift`; requires Full Disk Access; an unreadable index fails the command unless `--engine jxa`.
 
 ## 5. External Integrations
 

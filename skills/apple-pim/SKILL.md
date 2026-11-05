@@ -39,7 +39,7 @@ Each PIM domain requires separate macOS authorization:
 | Reminders | EventKit | Privacy & Security > Reminders |
 | Contacts | Contacts | Privacy & Security > Contacts |
 | Mail (mutations) | Automation (JXA) | Privacy & Security > Automation |
-| Mail (fast reads) | Full Disk Access | Privacy & Security > Full Disk Access |
+| Mail | Full Disk Access | Privacy & Security > Full Disk Access |
 | Calendars (subscribed availability) | Full Disk Access | Privacy & Security > Full Disk Access |
 
 ### Authorization States
