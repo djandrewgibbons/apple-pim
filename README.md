@@ -15,7 +15,7 @@ Native macOS integration for Calendar, Reminders, Contacts, and Mail using Event
 - **Reminder Management**: List reminder lists, create/complete/update/delete reminders, search
 - **Contact Management**: List groups, create/read/update/delete contacts, search by name/email/phone, birthday support (with or without year)
 - **Mail Integration**: List accounts/mailboxes, read/search/send/reply/move/delete messages, update flags, attachment support (metadata, save-to-disk, send/reply with attachments), verify sender authentication
-- **Fast Local Mail Reads**: Read commands query Apple Mail's local Envelope Index (SQLite) directly — 10–200× faster than AppleScript automation, and they work even when Mail.app is closed. Automatic fallback to JXA when Full Disk Access isn't granted. See [Direct SQLite read path](#direct-sqlite-read-path---engine-sqlite)
+- **Fast Local Mail Reads**: Read commands query Apple Mail's local Envelope Index (SQLite) directly — 10–200× faster than AppleScript automation, and they work even when Mail.app is closed. Requires Full Disk Access. See [Direct SQLite read path](#direct-sqlite-read-path---engine-sqlite)
 - **Recurrence Rules**: Create recurring events and reminders (daily, weekly, monthly, yearly)
 - **Batch Operations**: Create multiple events or reminders in a single efficient transaction
 - **Per-Domain Control**: Enable or disable entire domains (calendars, reminders, contacts, mail) independently
@@ -106,15 +106,14 @@ Optionally, configure the binary location if the CLIs are not on PATH:
 - System Settings > Privacy & Security > Automation
 - Allow Terminal (or your IDE) to control **Mail.app**
 
-**Full Disk Access (optional, recommended)**: Mail *read* commands use a fast
+**Full Disk Access (required for mail)**: Mail *read* commands use a fast
 direct-SQLite path (see "Direct SQLite read path" below) that requires Full Disk
-Access for Terminal (or the MCP host); without it, `--engine auto` silently
-falls back to the slower Mail.app Automation path and `--engine sqlite` reports
-the missing grant as an error. `update`, `move`, `delete`, `batch-update` and
-`batch-delete` consult that same index for the message's row-id before
-writing — the write itself always goes through Mail.app either way — so the
-grant governs their lookup on the same terms, with Mail.app's
-mailbox-by-mailbox scan as the `auto` fallback. Calendar uses the same grant to
+Access for Apple PIM Helper.app (or the terminal running the CLI). Without it,
+mail commands fail with an access error naming the missing grant; pass
+`--engine jxa` to use the slower Mail.app Automation path instead. `update`,
+`move`, `delete`, `batch-update` and `batch-delete` consult that same index for
+the message's row-id before writing — the write itself always goes through
+Mail.app — so they need the grant on the same terms. Calendar uses the same grant to
 read subscribed calendars' availability (see "Calendar store read path" below).
 
 ### Development Installation
@@ -432,8 +431,7 @@ calendar-cli create --title "Meeting" --start "tomorrow 2pm" --attendees '[{"ema
 
 Read commands (`accounts`, `mailboxes`, `messages`, `get`, `search`) default to
 `--engine auto`: they read Apple Mail's local **Envelope Index** SQLite database
-(`~/Library/Mail/V*/MailData/Envelope Index`) directly, falling back to JXA if
-the database isn't readable. Message bodies come straight from the on-disk
+(`~/Library/Mail/V*/MailData/Envelope Index`) directly. Message bodies come straight from the on-disk
 `.emlx` files. This is ~10–200× faster than the JXA path (subject search across
 an 80k-message mailbox: **~80ms vs ~15s**) and works even when Mail.app is not
 running. Mutations (`update`, `move`, `delete`, `send`, `reply`) always go
@@ -441,15 +439,18 @@ through Mail.app — nothing here ever writes to Mail's database. `update`,
 `move`, `delete`, `batch-update` and `batch-delete` do take `--engine` as well:
 under `auto` they look the message up in the same read-only index first, so
 Mail.app can be handed its row-id directly instead of scanning mailbox by
-mailbox, and they fall back to that scan whenever the lookup cannot answer.
+mailbox, and they fall back to that scan when the index has no match.
 `send` and `reply` are unaffected.
 
 - The database is only ever opened **read-only** (`SQLITE_OPEN_READONLY` +
   `PRAGMA query_only`); the fast path never writes to Mail's data.
-- Requires **Full Disk Access** for the invoking process (Terminal or the MCP
-  host). Without it, `--engine auto` silently uses JXA — check
-  `mail-cli auth-status` (`envelopeIndex.readable`) to see which path you get.
-- `--field content` search is not indexed locally and always uses JXA.
+- Requires **Full Disk Access** for the invoking process (Apple PIM Helper.app
+  or the terminal). Without it, `--engine auto` and `--engine sqlite` fail with
+  an access error rather than falling back, because the JXA scan of a large
+  mailbox runs long enough to surface as a helper timeout instead of the real
+  cause. Check `mail-cli auth-status` (`envelopeIndex.readable`).
+- Under `auto`, JXA serves only what the index cannot: `--field content` search
+  and bodies whose `.emlx` hasn't been downloaded.
 - Force a specific path with `--engine sqlite` or `--engine jxa`; responses
   from the fast path include `"engine": "sqlite"`. The write-path lookup emits
   no `engine` key: `batch-update` and `batch-delete` report the locator built

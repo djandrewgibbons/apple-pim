@@ -6,10 +6,11 @@ Read commands (`accounts`, `mailboxes`, `messages`, `get`, `search`) default to
 `--engine auto`: they query Apple Mail's **Envelope Index** SQLite database
 (`~/Library/Mail/V*/MailData/Envelope Index`, opened strictly read-only) and
 read bodies from on-disk `.emlx` files. This is ~10–200× faster than JXA and
-works with Mail.app closed, but requires Full Disk Access. When the database
-isn't readable — or for `--field content` search, or when a body's `.emlx`
-hasn't been downloaded — the command silently falls back to JXA. Check
-`auth-status` → `envelopeIndex.readable` to see which path is active.
+works with Mail.app closed, but requires Full Disk Access. For `--field content`
+search, or when a body's `.emlx` hasn't been downloaded, the command falls back
+to JXA. When the database isn't readable the command fails with an access error
+naming the missing Full Disk Access grant; `--engine jxa` bypasses the index.
+`auth-status` → `envelopeIndex.readable` shows whether the grant is in place.
 Mutations (`update`, `move`, `delete`, `send`, `reply`) are always performed by
 JXA/AppleScript — nothing here ever writes to Mail's database. `update`, `move`,
 `delete`, `batch-update` and `batch-delete` do take `--engine` as well: under
