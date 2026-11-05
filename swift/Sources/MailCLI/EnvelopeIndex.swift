@@ -8,6 +8,7 @@ import SQLite3
 
 enum EnvelopeIndexError: Error, LocalizedError {
     case notAvailable(String)
+    case unreadable(String)
     case queryFailed(String)
     case notFound(String)
     case ambiguous(String)
@@ -15,6 +16,7 @@ enum EnvelopeIndexError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notAvailable(let msg): return msg
+        case .unreadable(let msg): return msg
         case .queryFailed(let msg): return msg
         case .notFound(let msg): return msg
         case .ambiguous(let msg): return msg
@@ -55,9 +57,8 @@ final class EnvelopeIndex {
 
     static func open(home: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> EnvelopeIndex {
         guard let dbPath = discoverDatabase(home: home) else {
-            throw EnvelopeIndexError.notAvailable(
-                "Envelope Index not found or not readable under ~/Library/Mail/V*. "
-                + "The SQLite read path requires Full Disk Access.")
+            throw EnvelopeIndexError.unreadable(
+                "Envelope Index not found or not readable under ~/Library/Mail/V*.")
         }
         return try EnvelopeIndex(
             databasePath: dbPath,
@@ -77,7 +78,7 @@ final class EnvelopeIndex {
         guard rc == SQLITE_OK, let handle else {
             let msg = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "code \(rc)"
             if let handle { sqlite3_close_v2(handle) }
-            throw EnvelopeIndexError.notAvailable("Cannot open Envelope Index read-only: \(msg)")
+            throw EnvelopeIndexError.unreadable("Cannot open Envelope Index read-only: \(msg)")
         }
         db = handle
         sqlite3_busy_timeout(handle, 500)

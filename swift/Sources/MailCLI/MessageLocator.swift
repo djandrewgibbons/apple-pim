@@ -106,8 +106,8 @@ func makeMessageLocator(engine: EngineChoice) throws -> MessageLocator {
 
 /// The JS rowid map for a write command, plus the backend label its telemetry reports.
 ///
-/// Never fails the command under `auto`/`jxa`: a locator that cannot answer degrades to an
-/// empty map, and the JXA scan runs unchanged.
+/// Under `auto`, a locator that cannot answer degrades to an empty map and the JXA scan runs
+/// unchanged; an unreadable Envelope Index still fails (`rethrowFatalFastPathError`).
 func resolveRowidMap(for messageIds: [String], mailbox: String?, account: String?,
                      engine: EngineChoice) throws -> (js: String, backend: String) {
     let locator = try makeMessageLocator(engine: engine)

@@ -132,9 +132,18 @@ func checkMailEnabled(config: PIMConfiguration) throws {
 /// ambiguous scope with whichever account happens to enumerate first — the silent
 /// wrong-account read the ambiguity check exists to prevent — so it is fatal under every
 /// engine, and stays a caller error rather than an access-denied.
+///
+/// An unreadable Envelope Index is also fatal under `auto`: it means the responsible
+/// process lacks Full Disk Access, and the JXA path it would fall through to scans Mail's
+/// object model slowly enough to surface as a helper timeout instead of the real cause.
 func rethrowFatalFastPathError(_ engine: EngineChoice, _ error: Error) throws {
     if case EnvelopeIndexError.ambiguous(let message) = error {
         throw CLIError.invalidInput(message)
+    }
+    if engine != .jxa, case EnvelopeIndexError.unreadable(let message) = error {
+        throw CLIError.accessDenied(
+            "\(message) Grant Full Disk Access to Apple PIM Helper.app (or the calling terminal), "
+            + "or pass --engine jxa.")
     }
     guard engine == .sqlite else { return }
     let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -922,7 +931,7 @@ struct ListAccounts: AsyncParsableCommand {
 
     @OptionGroup var pimOptions: PIMOptions
 
-    @Option(name: .long, help: "Read engine: auto (SQLite with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Read engine: auto (SQLite; JXA only for what the index cannot serve), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     func run() async throws {
@@ -984,7 +993,7 @@ struct ListMailboxes: AsyncParsableCommand {
     @Option(name: .long, help: "Filter by account name")
     var account: String?
 
-    @Option(name: .long, help: "Read engine: auto (SQLite with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Read engine: auto (SQLite; JXA only for what the index cannot serve), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     func run() async throws {
@@ -1075,7 +1084,7 @@ struct ListMessages: AsyncParsableCommand {
     @Option(name: .long, help: "Filter: unread, flagged, or all (default: all)")
     var filter: String?
 
-    @Option(name: .long, help: "Read engine: auto (SQLite with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Read engine: auto (SQLite; JXA only for what the index cannot serve), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     @Option(name: .long, help: "Only messages received at or after this ISO 8601 timestamp. Implies oldest-first.")
@@ -1230,7 +1239,7 @@ struct GetMessage: AsyncParsableCommand {
     @Flag(name: .long, help: "Include raw RFC 2822 source in the response")
     var includeSource: Bool = false
 
-    @Option(name: .long, help: "Read engine: auto (SQLite with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Read engine: auto (SQLite; JXA only for what the index cannot serve), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     func run() async throws {
@@ -1361,7 +1370,7 @@ struct SearchMessages: AsyncParsableCommand {
     @Option(name: .long, help: "Only messages received on or after this date (ISO 8601: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)")
     var since: String?
 
-    @Option(name: .long, help: "Read engine: auto (SQLite with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Read engine: auto (SQLite; JXA only for what the index cannot serve), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     func run() async throws {
@@ -1512,7 +1521,7 @@ struct UpdateMessage: AsyncParsableCommand {
     @Option(name: .long, help: "Account name hint (speeds up lookup)")
     var account: String?
 
-    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path; JXA scan when the index has no match), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     /// No pre-op re-read here: a flag flip is reversible, so the post-`byId` messageId
@@ -1600,7 +1609,7 @@ struct MoveMessage: AsyncParsableCommand {
     @Option(name: .long, help: "Source account name hint (speeds up lookup)")
     var account: String?
 
-    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path; JXA scan when the index has no match), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     /// Layer 2: re-read the messageId immediately before the move and abort if it drifted.
@@ -1696,7 +1705,7 @@ struct DeleteMessage: AsyncParsableCommand {
     @Option(name: .long, help: "Account name hint (speeds up lookup)")
     var account: String?
 
-    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path; JXA scan when the index has no match), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     /// Layer 2: re-read the messageId immediately before the delete and abort if it drifted.
@@ -1776,7 +1785,7 @@ struct BatchUpdateMessages: AsyncParsableCommand {
     @Option(name: .long, help: "Account name hint (speeds up lookup)")
     var account: String?
 
-    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path; JXA scan when the index has no match), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     /// The measured hot path: one `findMsg` per message, previously a full mailbox scan
@@ -1890,7 +1899,7 @@ struct BatchDeleteMessages: AsyncParsableCommand {
     @Option(name: .long, help: "Account name hint (speeds up lookup)")
     var account: String?
 
-    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Message-lookup engine: auto (SQLite rowid fast path; JXA scan when the index has no match), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     /// Layer 2 per entry: a drifted id is pushed to `errors` and skipped so the rest of the
@@ -2678,7 +2687,7 @@ struct AuthCheck: AsyncParsableCommand {
     @Option(name: .long, help: "Account name hint (speeds up lookup)")
     var account: String?
 
-    @Option(name: .long, help: "Read engine: auto (SQLite with JXA fallback), sqlite, or jxa")
+    @Option(name: .long, help: "Read engine: auto (SQLite; JXA only for what the index cannot serve), sqlite, or jxa")
     var engine: EngineChoice = .auto
 
     func run() async throws {

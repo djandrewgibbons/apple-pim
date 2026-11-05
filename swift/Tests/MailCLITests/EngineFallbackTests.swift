@@ -27,7 +27,7 @@ final class EngineFallbackTests: XCTestCase {
     func testEngineFailuresStillFallThroughUnderAuto() throws {
         // Everything that is genuinely an engine limitation keeps its fallback.
         for error in [
-            EnvelopeIndexError.notAvailable("no Full Disk Access"),
+            EnvelopeIndexError.notAvailable("Content search requires the JXA engine"),
             .notFound("Mailbox not found: INBOX"),
             .queryFailed("no such table"),
         ] {
@@ -35,5 +35,20 @@ final class EngineFallbackTests: XCTestCase {
             XCTAssertNoThrow(try rethrowFatalFastPathError(.jxa, error))
             XCTAssertThrowsError(try rethrowFatalFastPathError(.sqlite, error))
         }
+    }
+
+    func testUnreadableIndexIsFatalUnlessJXAIsForced() throws {
+        // Falling through to JXA here turned a missing Full Disk Access grant into a
+        // helper timeout on large mailboxes.
+        let error = EnvelopeIndexError.unreadable("Envelope Index not found or not readable.")
+        for engine in [EngineChoice.auto, .sqlite] {
+            XCTAssertThrowsError(try rethrowFatalFastPathError(engine, error)) { thrown in
+                guard case CLIError.accessDenied(let message) = thrown else {
+                    return XCTFail("Expected accessDenied for \(engine), got \(thrown)")
+                }
+                XCTAssertTrue(message.contains("Full Disk Access"))
+            }
+        }
+        XCTAssertNoThrow(try rethrowFatalFastPathError(.jxa, error))
     }
 }

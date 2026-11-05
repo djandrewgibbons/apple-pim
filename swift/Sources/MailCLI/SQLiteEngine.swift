@@ -3,8 +3,8 @@ import Foundation
 
 // SQLite fast-path implementations for the read commands. Each function
 // produces the same JSON shape as its JXA counterpart; callers fall back to
-// JXA when anything here throws (no Full Disk Access, mailbox not found in
-// the index, .emlx not on disk, etc.).
+// JXA when the index can't serve the request (mailbox not found in the index,
+// .emlx not on disk, etc.). An unreadable index (no Full Disk Access) is fatal.
 
 enum EngineChoice: String, ExpressibleByArgument {
     case auto
